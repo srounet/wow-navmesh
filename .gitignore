@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+wheelhouse/
+.venv/
+venv/
+.build-venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Compiled extension modules
+*.so
+*.pyd
+*.dll
+
+# CMake / native build output
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+out/
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+Debug/
+Release/
+x64/
+x86/
+out/
+
+# OS cruft
+.DS_Store
+Thumbs.db

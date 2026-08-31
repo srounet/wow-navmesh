@@ -1,0 +1,46 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "wow-navmesh"
+version = "0.1.0"
+description = "Python bindings for Detour (recastnavigation) navmesh pathfinding over TrinityCore/AzerothCore mmaps"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "srounet" }]
+keywords = ["recastnavigation", "detour", "navmesh", "pathfinding", "trinitycore", "azerothcore", "wow"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Games/Entertainment",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/srounet/wow-navmesh"
+Repository = "https://github.com/srounet/wow-navmesh"
+Issues = "https://github.com/srounet/wow-navmesh/issues"
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+wheel.packages = ["src/wow_navmesh"]
+cmake.build-type = "Release"
+sdist.include = ["extern/recastnavigation/**"]
+
+[tool.scikit-build.cmake.define]
+WOW_NAVMESH_POLYREF64 = { env = "WOW_NAVMESH_POLYREF64", default = "ON" }
+
+[tool.cibuildwheel]
+build = "cp310-win_amd64 cp311-win_amd64 cp312-win_amd64 cp313-win_amd64"
+test-command = "python -c \"import wow_navmesh\""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
