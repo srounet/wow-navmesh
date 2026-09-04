@@ -23,13 +23,27 @@ class NavMesh:
         """Release the currently loaded map, if any."""
         ...
     def find_path(
-        self, start: Point3, end: Point3, max_points: int = 256
+        self,
+        start: Point3,
+        end: Point3,
+        max_points: int = 256,
+        waypoint_distance: float | None = None,
+        search_extent: float = 50.0,
     ) -> list[Point3]:
         """Find a path between two (x, y, z) points in world coordinates.
 
-        Returns a list of (x, y, z) tuples describing the straight path, or an empty
-        list if no path was found. Raises RuntimeError if no map is loaded, or
-        ValueError if max_points is not positive.
+        Args:
+            start: Starting point (x, y, z) in world coordinates.
+            end: Ending point (x, y, z) in world coordinates.
+            max_points: Maximum number of waypoints to return before subdivision (default 256).
+            waypoint_distance: If set, subdivides segments to maintain max distance between
+                waypoints. Useful for bot navigation to avoid gaps between waypoints.
+            search_extent: Search radius for finding the nearest polygon on the navmesh
+                (default 50.0). Increase for looser matching, decrease for tighter precision.
+
+        Returns: List of (x, y, z) tuples describing the path, or an empty list if no path
+            was found. Raises RuntimeError if no map is loaded, or ValueError if arguments
+            are invalid.
         """
         ...
     def __enter__(self) -> "NavMesh": ...

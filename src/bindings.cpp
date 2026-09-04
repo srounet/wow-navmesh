@@ -4,6 +4,7 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -276,15 +277,22 @@ public:
 
     // Returns the straight path between start and end as a list of (x, y, z) points
     // in WoW world coordinates. Returns an empty list if no path could be found.
-    std::vector<Point3> find_path(Point3 start, Point3 end, int max_points = 256) {
+    // waypoint_distance: if set, subdivides segments to maintain max distance between waypoints.
+    std::vector<Point3> find_path(Point3 start, Point3 end, int max_points = 256,
+                                   std::optional<float> waypoint_distance = std::nullopt,
+                                   float search_extent = 50.0f) {
         if (!nav_mesh_ || !nav_query_)
             throw std::runtime_error("no map loaded; call load_map() first");
         if (max_points <= 0)
             throw std::invalid_argument("max_points must be positive");
+        if (waypoint_distance && *waypoint_distance <= 0)
+            throw std::invalid_argument("waypoint_distance must be positive");
+        if (search_extent <= 0)
+            throw std::invalid_argument("search_extent must be positive");
 
         float s[3] = {std::get<1>(start), std::get<2>(start), std::get<0>(start)};
         float e[3] = {std::get<1>(end), std::get<2>(end), std::get<0>(end)};
-        float extents[3] = {50.0f, 50.0f, 50.0f};
+        float extents[3] = {search_extent, search_extent, search_extent};
         dtQueryFilter filter;
 
         dtPolyRef start_poly, end_poly;
@@ -318,6 +326,33 @@ public:
         result.reserve(static_cast<size_t>(point_count));
         for (int i = 0; i < point_count; i++)
             result.emplace_back(points[i * 3 + 2], points[i * 3], points[i * 3 + 1]);
+
+        if (waypoint_distance) {
+            std::vector<Point3> subdivided;
+            subdivided.push_back(result[0]);
+            for (size_t i = 1; i < result.size(); i++) {
+                const auto& prev = subdivided.back();
+                const auto& curr = result[i];
+                float dx = std::get<0>(curr) - std::get<0>(prev);
+                float dy = std::get<1>(curr) - std::get<1>(prev);
+                float dz = std::get<2>(curr) - std::get<2>(prev);
+                float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+                if (dist > *waypoint_distance) {
+                    int segments = static_cast<int>(std::ceil(dist / *waypoint_distance));
+                    for (int j = 1; j < segments; j++) {
+                        float t = static_cast<float>(j) / segments;
+                        subdivided.emplace_back(
+                            std::get<0>(prev) + dx * t,
+                            std::get<1>(prev) + dy * t,
+                            std::get<2>(prev) + dz * t);
+                    }
+                }
+                subdivided.push_back(curr);
+            }
+            return subdivided;
+        }
+
         return result;
     }
 
@@ -341,10 +376,13 @@ NB_MODULE(_wow_navmesh, m) {
              "Raises RuntimeError if the mmap files are missing or invalid.")
         .def("free_map", &NavMesh::free_map, "Release the currently loaded map, if any.")
         .def("find_path", &NavMesh::find_path, nb::arg("start"), nb::arg("end"),
-             nb::arg("max_points") = 256,
+             nb::arg("max_points") = 256, nb::arg("waypoint_distance") = nb::none(),
+             nb::arg("search_extent") = 50.0f,
              "Find a path between two (x, y, z) points in world coordinates. Returns a list "
              "of (x, y, z) tuples describing the straight path, or an empty list if no path "
-             "was found. Raises RuntimeError if no map is loaded.")
+             "was found. waypoint_distance subdivides segments for precise bot navigation. "
+             "search_extent controls polygon search radius (default 50). Raises RuntimeError "
+             "if no map is loaded.")
         .def_prop_ro("is_loaded", &NavMesh::is_loaded)
         .def_prop_ro("map_id", &NavMesh::map_id)
         .def_prop_ro("mmaps_path", &NavMesh::mmaps_path)

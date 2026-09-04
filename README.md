@@ -31,12 +31,35 @@ for x, y, z in path:
     print(x, y, z)
 ```
 
+### Precision for bot navigation
+
+For precise bot navigation with closely-spaced waypoints, use `waypoint_distance` to
+subdivide the path:
+
+```python
+# Return waypoints no more than 2.5 units apart
+path = nm.find_path(
+    (x1, y1, z1), (x2, y2, z2),
+    waypoint_distance=2.5  # Add intermediate waypoints every 2.5 units
+)
+```
+
+You can also adjust the search radius for finding polygons on the navmesh (default 50):
+
+```python
+# Tighter matching (more restrictive)
+path = nm.find_path((x1, y1, z1), (x2, y2, z2), search_extent=20.0)
+
+# Looser matching (more forgiving)
+path = nm.find_path((x1, y1, z1), (x2, y2, z2), search_extent=100.0)
+```
+
 `NavMesh` also works as a context manager, freeing the loaded map on exit:
 
 ```python
 with wn.NavMesh(r"C:\path\to\mmaps") as nm:
     nm.load_map(0)
-    ...
+    path = nm.find_path((x1, y1, z1), (x2, y2, z2))
 ```
 
 Coordinates are `(x, y, z)` in WoW world-coordinate order everywhere in this API. The
@@ -50,9 +73,13 @@ Coordinates are `(x, y, z)` in WoW world-coordinate order everywhere in this API
   loaded. Raises `RuntimeError` if the files are missing, truncated, or were built for a
   different `dtPolyRef` layout than this build targets (see below).
 - `.free_map()` — release the currently loaded map.
-- `.find_path(start, end, max_points=256) -> list[(x, y, z)]` — the straight path
-  between two points, or `[]` if none was found. Raises `RuntimeError` if no map is
-  loaded, `ValueError` if `max_points <= 0`.
+- `.find_path(start, end, max_points=256, waypoint_distance=None, search_extent=50.0) -> list[(x, y, z)]`
+  — the straight path between two points, or `[]` if none was found.
+  - `waypoint_distance` (optional): if set, subdivides the path to maintain max distance
+    between waypoints (useful for smooth bot navigation).
+  - `search_extent` (default 50.0): search radius for finding the nearest polygon on the
+    navmesh. Increase for looser matching, decrease for tighter precision.
+  - Raises `RuntimeError` if no map is loaded, `ValueError` if arguments are invalid.
 - `.is_loaded`, `.map_id`, `.mmaps_path` — read-only properties.
 
 Full type stubs ship with the package (`py.typed`).
@@ -111,8 +138,9 @@ pytest
 
 - Only verified against TrinityCore/AzerothCore mmaps for WoW 3.3.5a. The mmap format
   may differ across core versions or forks; nothing here has been tested against those.
-- The nearest-poly search extents (50 units on each axis) and the internal path-buffer
-  size (512 polygons) used by `find_path()` are currently fixed, not configurable.
+- The internal path-buffer size (512 polygons) used by `find_path()` is currently fixed,
+  not configurable. This is rarely a limitation in practice (paths over navmeshes rarely
+  exceed ~100 polygons).
 - License: TBD (recastnavigation/Detour itself is zlib-licensed; its notice is included
   under `extern/recastnavigation/`).
 
