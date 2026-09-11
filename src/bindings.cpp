@@ -20,6 +20,7 @@
 #include "DetourCommon.h"
 #include "DetourNavMesh.h"
 #include "DetourNavMeshQuery.h"
+#include "DetourPathCorridor.h"
 
 namespace nb = nanobind;
 namespace fs = std::filesystem;
@@ -157,6 +158,16 @@ using DtBuffer = std::unique_ptr<unsigned char, DtAllocDeleter>;
 
 using Point3 = std::tuple<float, float, float>;
 
+// mmap/mmtile files store coordinates as (y, z, x); WoW's world coordinates (and every
+// public function in this module) use (x, y, z). These two helpers are the only place
+// that swap ever happens, so no new query function can silently get it wrong.
+inline void wowToDetour(const Point3& p, float* out) {
+    out[0] = std::get<1>(p);
+    out[1] = std::get<2>(p);
+    out[2] = std::get<0>(p);
+}
+inline Point3 detourToWow(const float* p) { return Point3(p[2], p[0], p[1]); }
+
 // Mirrors MaNGOS PathFinder's PATHFIND_* distinction: whether the path actually reaches
 // the requested end, or only gets as close as the navmesh allows.
 enum class PathType {
@@ -222,6 +233,590 @@ bool portalMidpoint(const dtNavMesh* nav, dtPolyRef from, dtPolyRef to, float* m
     mid[1] = (left[1] + right[1]) * 0.5f;
     mid[2] = (left[2] + right[2]) * 0.5f;
     return true;
+}
+
+// Explicit outcome of a Detour query, replacing the old habit of collapsing every
+// failure mode into an empty result. Distinguishes "no path exists" from "start/end
+// isn't on the mesh" from "the result buffer was too small" from "Detour itself failed".
+enum class PathStatus {
+    Success = 0,
+    Partial,
+    NoPath,
+    StartNotFound,
+    EndNotFound,
+    InvalidStart,
+    InvalidEnd,
+    BufferFull,
+    QueryFailed,
+};
+
+// Thin Python-friendly wrapper over dtQueryFilter. Kept intentionally close to the
+// Detour type -- area costs are already extensible via setAreaCost, no need to invent a
+// parallel mechanism for it.
+class QueryFilter {
+public:
+    unsigned short include_flags() const { return filter_.getIncludeFlags(); }
+    void set_include_flags(unsigned short f) { filter_.setIncludeFlags(f); }
+    unsigned short exclude_flags() const { return filter_.getExcludeFlags(); }
+    void set_exclude_flags(unsigned short f) { filter_.setExcludeFlags(f); }
+    float area_cost(int area) const { return filter_.getAreaCost(area); }
+    void set_area_cost(int area, float cost) { filter_.setAreaCost(area, cost); }
+    const dtQueryFilter& raw() const { return filter_; }
+
+private:
+    dtQueryFilter filter_;
+};
+
+// Replaces the magic constants (50-unit search extent, 512-poly buffer) that used to be
+// hardcoded inside find_path().
+struct QueryConfig {
+    std::tuple<float, float, float> nearest_poly_extents{50.0f, 50.0f, 50.0f};
+    int max_path_polys = 512;
+    int max_straight_path_points = 256;
+};
+
+struct NearestPolyResult {
+    bool found = false;
+    dtPolyRef poly_ref = 0;
+    Point3 position{0.0f, 0.0f, 0.0f};
+    float distance = -1.0f;
+};
+
+struct PolygonPathResult {
+    PathStatus status = PathStatus::QueryFailed;
+    dtPolyRef start_poly = 0;
+    dtPolyRef end_poly = 0;
+    std::vector<dtPolyRef> polygons;
+    bool reached_end = false;
+};
+
+struct StraightPathPoint {
+    Point3 position{0.0f, 0.0f, 0.0f};
+    unsigned char flags = 0;
+    dtPolyRef poly_ref = 0;
+};
+
+struct StraightPathResult {
+    PathStatus status = PathStatus::QueryFailed;
+    std::vector<StraightPathPoint> points;
+};
+
+struct MoveAlongSurfaceResult {
+    PathStatus status = PathStatus::QueryFailed;
+    Point3 position{0.0f, 0.0f, 0.0f};
+    std::vector<dtPolyRef> visited;
+};
+
+struct RaycastResult {
+    bool hit = false;
+    Point3 position{0.0f, 0.0f, 0.0f};
+    Point3 normal{0.0f, 0.0f, 0.0f};
+    float t = 0.0f;
+    std::vector<dtPolyRef> path;
+};
+
+struct WallDistanceResult {
+    float distance = -1.0f;
+    Point3 position{0.0f, 0.0f, 0.0f};
+    Point3 normal{0.0f, 0.0f, 0.0f};
+};
+
+struct SteerTarget {
+    Point3 position{0.0f, 0.0f, 0.0f};
+    dtPolyRef poly_ref = 0;
+    float distance = 0.0f;
+    bool reached = false;
+    bool off_mesh = false;
+};
+
+class Path;    // forward decl; defined after NavigationQuery, which builds it.
+class NavMesh; // forward decl; NavigationQuery/Path only need it to detect a reload/free
+               // that has invalidated the raw pointers they were built from.
+
+// Thin wrapper around dtNavMeshQuery. Non-owning: the dtNavMesh/dtNavMeshQuery it points
+// to are owned by the NavMesh that created it. load_map()/free_map() on that NavMesh free
+// and reallocate them, which would otherwise leave any previously-issued NavigationQuery
+// holding dangling pointers; owner_/generation_ let every method detect that and raise
+// instead of touching freed memory. (nanobind keep_alive on NavMesh::query() keeps the
+// NavMesh Python object itself alive for as long as this one exists, so owner_ is always
+// safe to dereference -- only *what it points to* may have changed.)
+class NavigationQuery {
+public:
+    NavigationQuery(dtNavMesh* mesh, dtNavMeshQuery* query, QueryConfig config, const NavMesh* owner,
+                     int generation)
+        : mesh_(mesh), query_(query), config_(config), owner_(owner), generation_(generation) {}
+
+    NearestPolyResult find_nearest_poly(Point3 position,
+                                         std::optional<std::tuple<float, float, float>> extents,
+                                         const QueryFilter* filter) const {
+        ensureFresh();
+        const dtQueryFilter defaultFilter;
+        const dtQueryFilter* f = filter ? &filter->raw() : &defaultFilter;
+        float pos[3];
+        wowToDetour(position, pos);
+        float ext[3];
+        extentsOrDefault(extents, ext);
+
+        NearestPolyResult result;
+        float resultPos[3] = {0.0f, 0.0f, 0.0f};
+        dtStatus st = query_->findNearestPoly(pos, ext, f, &result.poly_ref, resultPos);
+        result.found = dtStatusSucceed(st) && result.poly_ref != 0;
+        if (result.found) {
+            result.position = detourToWow(resultPos);
+            result.distance = dtVdist(pos, resultPos);
+        } else {
+            result.poly_ref = 0;
+        }
+        return result;
+    }
+
+    // Raw Detour corridor: start/end polygon plus the polygon chain between them. Kept
+    // separate from find_straight_path/find_path so callers who only need the corridor
+    // (e.g. to feed it elsewhere) don't pay for straight-path generation they don't want.
+    PolygonPathResult find_polygon_path(Point3 start, Point3 end, const QueryFilter* filter,
+                                         std::optional<int> max_polys) const {
+        ensureFresh();
+        const dtQueryFilter defaultFilter;
+        const dtQueryFilter* f = filter ? &filter->raw() : &defaultFilter;
+        const int maxPolys = max_polys.value_or(config_.max_path_polys);
+        if (maxPolys <= 0)
+            throw std::invalid_argument("max_polys must be positive");
+
+        float s[3];
+        wowToDetour(start, s);
+        float e[3];
+        wowToDetour(end, e);
+        float ext[3];
+        extentsOrDefault(std::nullopt, ext);
+
+        PolygonPathResult result;
+        float startPt[3], endPt[3];
+        dtStatus st = query_->findNearestPoly(s, ext, f, &result.start_poly, startPt);
+        if (dtStatusFailed(st) || !result.start_poly) {
+            result.status = PathStatus::StartNotFound;
+            result.start_poly = 0;
+            return result;
+        }
+        st = query_->findNearestPoly(e, ext, f, &result.end_poly, endPt);
+        if (dtStatusFailed(st) || !result.end_poly) {
+            result.status = PathStatus::EndNotFound;
+            result.end_poly = 0;
+            return result;
+        }
+
+        std::vector<dtPolyRef> polys(static_cast<std::size_t>(maxPolys));
+        int count = 0;
+        st = query_->findPath(result.start_poly, result.end_poly, startPt, endPt, f, polys.data(),
+                               &count, maxPolys);
+        if (dtStatusFailed(st)) {
+            result.status =
+                dtStatusDetail(st, DT_BUFFER_TOO_SMALL) ? PathStatus::BufferFull : PathStatus::QueryFailed;
+            return result;
+        }
+        if (count == 0) {
+            result.status = PathStatus::NoPath;
+            return result;
+        }
+        polys.resize(static_cast<std::size_t>(count));
+        result.reached_end = polys.back() == result.end_poly;
+        result.polygons = std::move(polys);
+        result.status = result.reached_end ? PathStatus::Success : PathStatus::Partial;
+        return result;
+    }
+
+    // Detour's findStraightPath() over an already-computed polygon corridor. Does not
+    // itself locate start/end polygons -- pass the corridor from find_polygon_path().
+    StraightPathResult find_straight_path(Point3 start, Point3 end,
+                                           const std::vector<dtPolyRef>& polygons,
+                                           const QueryFilter* filter,
+                                           std::optional<int> max_points) const {
+        ensureFresh();
+        if (polygons.empty())
+            throw std::invalid_argument("polygons must be non-empty");
+        const int maxPts = max_points.value_or(config_.max_straight_path_points);
+        if (maxPts <= 0)
+            throw std::invalid_argument("max_points must be positive");
+
+        float s[3];
+        wowToDetour(start, s);
+        float e[3];
+        wowToDetour(end, e);
+
+        std::vector<float> pts(static_cast<std::size_t>(maxPts) * 3);
+        std::vector<unsigned char> flags(static_cast<std::size_t>(maxPts));
+        std::vector<dtPolyRef> refs(static_cast<std::size_t>(maxPts));
+        int count = 0;
+        dtStatus st = query_->findStraightPath(s, e, polygons.data(), static_cast<int>(polygons.size()),
+                                                pts.data(), flags.data(), refs.data(), &count, maxPts);
+
+        StraightPathResult result;
+        if (dtStatusFailed(st)) {
+            result.status =
+                dtStatusDetail(st, DT_BUFFER_TOO_SMALL) ? PathStatus::BufferFull : PathStatus::QueryFailed;
+            return result;
+        }
+        result.points.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; i++) {
+            StraightPathPoint p;
+            p.position = detourToWow(&pts[static_cast<std::size_t>(i) * 3]);
+            p.flags = flags[static_cast<std::size_t>(i)];
+            p.poly_ref = refs[static_cast<std::size_t>(i)];
+            result.points.push_back(p);
+        }
+        result.status = dtStatusDetail(st, DT_PARTIAL_RESULT) ? PathStatus::Partial : PathStatus::Success;
+        return result;
+    }
+
+    // dtNavMeshQuery::moveAlongSurface(): slides a point across the walkable surface
+    // toward a desired position, without leaving the mesh. Central to steering: callers
+    // use it to advance an agent's actual position each tick.
+    MoveAlongSurfaceResult move_along_surface(Point3 current, Point3 desired, dtPolyRef start_poly,
+                                               const QueryFilter* filter,
+                                               std::optional<int> max_visited) const {
+        ensureFresh();
+        if (!start_poly)
+            throw std::invalid_argument("start_poly must be non-zero");
+        const dtQueryFilter defaultFilter;
+        const dtQueryFilter* f = filter ? &filter->raw() : &defaultFilter;
+        const int maxVisited = max_visited.value_or(32);
+        if (maxVisited <= 0)
+            throw std::invalid_argument("max_visited must be positive");
+
+        float s[3];
+        wowToDetour(current, s);
+        float e[3];
+        wowToDetour(desired, e);
+        float resultPos[3] = {0.0f, 0.0f, 0.0f};
+        std::vector<dtPolyRef> visited(static_cast<std::size_t>(maxVisited));
+        int visitedCount = 0;
+        dtStatus st = query_->moveAlongSurface(start_poly, s, e, f, resultPos, visited.data(),
+                                                &visitedCount, maxVisited);
+
+        MoveAlongSurfaceResult result;
+        result.status = dtStatusFailed(st) ? PathStatus::QueryFailed : PathStatus::Success;
+        result.position = detourToWow(resultPos);
+        visited.resize(static_cast<std::size_t>(visitedCount));
+        result.visited = std::move(visited);
+        return result;
+    }
+
+    // Detour's navmesh-surface raycast -- not a geometric approximation. If start_poly
+    // isn't given, it's found via find_nearest_poly first.
+    RaycastResult raycast(Point3 start, Point3 end, std::optional<dtPolyRef> start_poly,
+                           const QueryFilter* filter, std::optional<int> max_path) const {
+        ensureFresh();
+        const dtQueryFilter defaultFilter;
+        const dtQueryFilter* f = filter ? &filter->raw() : &defaultFilter;
+        float s[3];
+        wowToDetour(start, s);
+        float e[3];
+        wowToDetour(end, e);
+
+        dtPolyRef startRef = start_poly.value_or(0);
+        if (!startRef) {
+            float ext[3];
+            extentsOrDefault(std::nullopt, ext);
+            float nearestPt[3];
+            query_->findNearestPoly(s, ext, f, &startRef, nearestPt);
+        }
+
+        RaycastResult result;
+        if (!startRef)
+            return result;
+
+        const int maxPath = max_path.value_or(config_.max_path_polys);
+        if (maxPath <= 0)
+            throw std::invalid_argument("max_path must be positive");
+        std::vector<dtPolyRef> path(static_cast<std::size_t>(maxPath));
+        int pathCount = 0;
+        float t = 0.0f;
+        float hitNormal[3] = {0.0f, 0.0f, 0.0f};
+        dtStatus st = query_->raycast(startRef, s, e, f, &t, hitNormal, path.data(), &pathCount, maxPath);
+        if (dtStatusFailed(st))
+            return result;
+
+        result.hit = t < 1.0f;
+        result.t = t;
+        float hitPos[3];
+        dtVlerp(hitPos, s, e, t < 1.0f ? t : 1.0f);
+        result.position = detourToWow(hitPos);
+        result.normal = detourToWow(hitNormal);
+        path.resize(static_cast<std::size_t>(pathCount));
+        result.path = std::move(path);
+        return result;
+    }
+
+    Point3 closest_point_on_poly(dtPolyRef poly_ref, Point3 position) const {
+        ensureFresh();
+        float pos[3];
+        wowToDetour(position, pos);
+        float closest[3];
+        bool overPoly = false;
+        if (dtStatusFailed(query_->closestPointOnPoly(poly_ref, pos, closest, &overPoly)))
+            throw std::runtime_error("closestPointOnPoly failed: invalid poly_ref");
+        return detourToWow(closest);
+    }
+
+    Point3 closest_point_on_poly_boundary(dtPolyRef poly_ref, Point3 position) const {
+        ensureFresh();
+        float pos[3];
+        wowToDetour(position, pos);
+        float closest[3];
+        if (dtStatusFailed(query_->closestPointOnPolyBoundary(poly_ref, pos, closest)))
+            throw std::runtime_error("closestPointOnPolyBoundary failed: invalid poly_ref");
+        return detourToWow(closest);
+    }
+
+    float get_poly_height(dtPolyRef poly_ref, Point3 position) const {
+        ensureFresh();
+        float pos[3];
+        wowToDetour(position, pos);
+        float height = 0.0f;
+        if (dtStatusFailed(query_->getPolyHeight(poly_ref, pos, &height)))
+            throw std::runtime_error(
+                "getPolyHeight failed: invalid poly_ref, or position outside its xz-bounds");
+        return height;
+    }
+
+    // Distance from a point to the nearest navmesh wall within max_radius. distance stays
+    // -1 (position/normal untouched) only when no polygon at all is found near position --
+    // a common non-error, so this doesn't throw for it. If a polygon is found but no wall
+    // lies within max_radius (open area), Detour itself returns distance == max_radius
+    // with position left at whatever was passed in -- that's upstream dtNavMeshQuery's own
+    // behavior, not a distinct "not found" case; check `distance < max_radius` to tell a
+    // real wall hit apart from "nothing that close".
+    WallDistanceResult find_distance_to_wall(Point3 position, std::optional<dtPolyRef> start_poly,
+                                              float max_radius, const QueryFilter* filter) const {
+        ensureFresh();
+        if (max_radius <= 0)
+            throw std::invalid_argument("max_radius must be positive");
+        const dtQueryFilter defaultFilter;
+        const dtQueryFilter* f = filter ? &filter->raw() : &defaultFilter;
+        float pos[3];
+        wowToDetour(position, pos);
+
+        dtPolyRef ref = start_poly.value_or(0);
+        if (!ref) {
+            float ext[3];
+            extentsOrDefault(std::nullopt, ext);
+            float nearestPt[3];
+            query_->findNearestPoly(pos, ext, f, &ref, nearestPt);
+        }
+
+        WallDistanceResult result;
+        if (!ref)
+            return result;
+
+        float dist = 0.0f, hitPos[3] = {0.0f, 0.0f, 0.0f}, hitNormal[3] = {0.0f, 0.0f, 0.0f};
+        if (dtStatusFailed(query_->findDistanceToWall(ref, pos, max_radius, f, &dist, hitPos, hitNormal)))
+            return result;
+        result.distance = dist;
+        result.position = detourToWow(hitPos);
+        result.normal = detourToWow(hitNormal);
+        return result;
+    }
+
+    // High-level convenience: polygon corridor + straight path + steering state, bundled
+    // into one Path object instead of a bare point list.
+    Path find_path(Point3 start, Point3 end, const QueryFilter* filter,
+                    std::optional<int> max_polys) const;
+
+    const QueryConfig& config() const { return config_; }
+    void set_config(QueryConfig config) { config_ = config; }
+
+private:
+    void extentsOrDefault(std::optional<std::tuple<float, float, float>> extents, float* out) const {
+        const auto& e = extents ? *extents : config_.nearest_poly_extents;
+        out[0] = std::get<0>(e);
+        out[1] = std::get<1>(e);
+        out[2] = std::get<2>(e);
+    }
+
+    // Declared here, defined after NavMesh (below) since it needs NavMesh::generation()
+    // to be a complete-type call.
+    void ensureFresh() const;
+
+    dtNavMesh* mesh_;
+    dtNavMeshQuery* query_;
+    QueryConfig config_;
+    const NavMesh* owner_;
+    int generation_;
+};
+
+// Bundles everything a caller needs to act on one find_path() result: the polygon
+// corridor, the straight (funnel) path, and enough live state (a dtPathCorridor) to ask
+// for a steering target as the agent moves. Replaces the old "throw away everything but
+// a point list" behavior of NavMesh::find_path().
+class Path {
+public:
+    Path(dtNavMeshQuery* query, PathStatus status, Point3 start, Point3 requested_end,
+         Point3 actual_end, dtPolyRef start_poly, dtPolyRef end_poly, std::vector<dtPolyRef> corridor,
+         std::vector<StraightPathPoint> straight_path, int max_polys, dtQueryFilter filter,
+         const NavMesh* owner, int generation)
+        : query_(query),
+          status_(status),
+          start_(start),
+          requested_end_(requested_end),
+          actual_end_(actual_end),
+          start_poly_(start_poly),
+          end_poly_(end_poly),
+          corridor_(std::move(corridor)),
+          straight_path_(std::move(straight_path)),
+          filter_(filter),
+          owner_(owner),
+          generation_(generation) {
+        if (!corridor_.empty() && query_) {
+            corridor_state_ = std::make_unique<dtPathCorridor>();
+            corridor_state_->init(std::max(max_polys, static_cast<int>(corridor_.size())));
+            float startPos[3];
+            wowToDetour(start_, startPos);
+            corridor_state_->reset(start_poly_, startPos);
+            float endPos[3];
+            wowToDetour(actual_end_, endPos);
+            corridor_state_->setCorridor(endPos, corridor_.data(), static_cast<int>(corridor_.size()));
+        }
+    }
+
+    bool is_valid() const {
+        return status_ != PathStatus::NoPath && status_ != PathStatus::StartNotFound &&
+               status_ != PathStatus::EndNotFound && status_ != PathStatus::QueryFailed &&
+               status_ != PathStatus::BufferFull;
+    }
+    bool is_complete() const { return status_ == PathStatus::Success; }
+    PathStatus status() const { return status_; }
+    Point3 start_position() const { return start_; }
+    Point3 requested_end_position() const { return requested_end_; }
+    Point3 actual_end_position() const { return actual_end_; }
+    dtPolyRef start_poly() const { return start_poly_; }
+    dtPolyRef end_poly() const { return end_poly_; }
+    const std::vector<dtPolyRef>& polygon_corridor() const { return corridor_; }
+    const std::vector<StraightPathPoint>& straight_path() const { return straight_path_; }
+
+    // Ports AzerothCore PathGenerator::GetSteerTarget / dtCrowd's own per-tick steering:
+    // advances corridor_state_ (a dtPathCorridor) to current_position via movePosition()
+    // -- which clamps to the mesh and trims polygons already passed -- then asks it for
+    // corners via findCorners(), and skips any corner already within min_target_distance.
+    // A naive rewrite would call findStraightPath() directly over the *original, static*
+    // polygon corridor on every call; that silently assumes the agent is still standing
+    // in corridor_[0], which stops holding a few steps after the agent has moved past it
+    // (the funnel then anchors itself to the wrong end of the corridor and its output
+    // stops advancing). dtPathCorridor exists specifically to avoid re-deriving that
+    // trimming logic by hand.
+    std::optional<SteerTarget> get_steer_target(Point3 current, float min_target_distance,
+                                                 float max_target_distance) const {
+        ensureFresh();
+        if (!query_ || !corridor_state_)
+            return std::nullopt;
+        if (min_target_distance <= 0 || max_target_distance <= 0)
+            throw std::invalid_argument("min_target_distance and max_target_distance must be positive");
+
+        float pos[3];
+        wowToDetour(current, pos);
+        corridor_state_->movePosition(pos, query_, &filter_);
+
+        constexpr int kMaxCorners = 3;
+        float cornerVerts[kMaxCorners * 3];
+        unsigned char cornerFlags[kMaxCorners];
+        dtPolyRef cornerPolys[kMaxCorners];
+        const int nCorners = corridor_state_->findCorners(cornerVerts, cornerFlags, cornerPolys,
+                                                            kMaxCorners, query_, &filter_);
+        const float* agentPos = corridor_state_->getPos();  // mesh-clamped by movePosition()
+
+        if (nCorners == 0) {
+            // dtPathCorridor::findCorners() legitimately prunes its corner list down to
+            // zero once the agent is within its own 0.01-unit tolerance of the final
+            // point -- there's nothing left to steer toward because it has arrived.
+            // Without this check that "arrived" case would be indistinguishable from a
+            // genuinely broken corridor, both surfacing as None.
+            float endPos[3];
+            wowToDetour(actual_end_, endPos);
+            const float distToEnd = dtVdist(agentPos, endPos);
+            if (distToEnd < min_target_distance) {
+                SteerTarget target;
+                target.position = actual_end_;
+                target.poly_ref = end_poly_;
+                target.distance = distToEnd;
+                target.off_mesh = false;
+                target.reached = true;
+                return target;
+            }
+            return std::nullopt;
+        }
+
+        int idx = 0;
+        while (idx < nCorners) {
+            const float* pt = &cornerVerts[idx * 3];
+            const float dx = pt[0] - agentPos[0];
+            const float dz = pt[2] - agentPos[2];
+            const bool horizontallyClose = (dx * dx + dz * dz) < min_target_distance * min_target_distance;
+            const bool verticallyClose = std::fabs(pt[1] - agentPos[1]) < max_target_distance;
+            const bool offMesh = (cornerFlags[idx] & DT_STRAIGHTPATH_OFFMESH_CONNECTION) != 0;
+            if (offMesh || !(horizontallyClose && verticallyClose))
+                break;
+            idx++;
+        }
+        if (idx >= nCorners)
+            idx = nCorners - 1;
+
+        const float* pt = &cornerVerts[idx * 3];
+        float endPos[3];
+        wowToDetour(actual_end_, endPos);
+
+        SteerTarget target;
+        target.position = detourToWow(pt);
+        target.poly_ref = cornerPolys[idx];
+        target.distance = dtVdist(agentPos, pt);
+        target.off_mesh = (cornerFlags[idx] & DT_STRAIGHTPATH_OFFMESH_CONNECTION) != 0;
+        target.reached = (cornerFlags[idx] & DT_STRAIGHTPATH_END) != 0 &&
+                          dtVdist(agentPos, endPos) < min_target_distance;
+        return target;
+    }
+
+private:
+    // Declared here, defined after NavMesh (below) since it needs NavMesh::generation()
+    // to be a complete-type call.
+    void ensureFresh() const;
+
+    dtNavMeshQuery* query_;
+    PathStatus status_;
+    Point3 start_;
+    Point3 requested_end_;
+    Point3 actual_end_;
+    dtPolyRef start_poly_;
+    dtPolyRef end_poly_;
+    std::vector<dtPolyRef> corridor_;
+    std::vector<StraightPathPoint> straight_path_;
+    std::unique_ptr<dtPathCorridor> corridor_state_;
+    dtQueryFilter filter_;
+    const NavMesh* owner_;
+    int generation_;
+};
+
+inline Path NavigationQuery::find_path(Point3 start, Point3 end, const QueryFilter* filter,
+                                        std::optional<int> max_polys) const {
+    ensureFresh();
+    const dtQueryFilter resolvedFilter = filter ? filter->raw() : dtQueryFilter();
+    PolygonPathResult poly = find_polygon_path(start, end, filter, max_polys);
+    const int maxPolys = max_polys.value_or(config_.max_path_polys);
+
+    if (poly.polygons.empty())
+        return Path(query_, poly.status, start, end, start, poly.start_poly, poly.end_poly, {}, {},
+                    maxPolys, resolvedFilter, owner_, generation_);
+
+    const Point3 clampedStart = closest_point_on_poly(poly.start_poly, start);
+    const Point3 clampedEnd = closest_point_on_poly(poly.end_poly, end);
+    StraightPathResult straight = find_straight_path(clampedStart, clampedEnd, poly.polygons, filter,
+                                                      std::nullopt);
+    const Point3 actualEnd = straight.points.empty() ? clampedStart : straight.points.back().position;
+
+    PathStatus status = poly.status;
+    if (poly.reached_end)
+        status = straight.status == PathStatus::Success ? PathStatus::Success : PathStatus::Partial;
+    else
+        status = PathStatus::Partial;
+
+    return Path(query_, status, clampedStart, end, actualEnd, poly.start_poly, poly.end_poly,
+                poly.polygons, straight.points, maxPolys, resolvedFilter, owner_, generation_);
 }
 
 // Wraps a dtNavMesh/dtNavMeshQuery pair for one loaded map. mmap tile files store
@@ -327,8 +922,12 @@ public:
         nav_mesh_ = mesh.release();
         nav_query_ = query;
         map_id_ = map_id;
+        generation_++;
     }
 
+    // Every call frees the current map's dtNavMesh/dtNavMeshQuery (if any) and bumps
+    // generation_, so any NavigationQuery/Path built from the old ones will raise
+    // instead of touching freed memory (see NavigationQuery::ensureFresh() below).
     void free_map() {
         if (nav_query_) {
             dtFreeNavMeshQuery(nav_query_);
@@ -339,13 +938,29 @@ public:
             nav_mesh_ = nullptr;
         }
         map_id_.reset();
+        generation_++;
     }
+
+    int generation() const { return generation_; }
 
     bool is_loaded() const { return nav_mesh_ != nullptr; }
 
     std::optional<unsigned int> map_id() const { return map_id_; }
 
     const std::string& mmaps_path() const { return mmaps_path_; }
+
+    // Returns a NavigationQuery bound to the currently loaded map. Cheap to construct
+    // (two pointers + a small config struct copy), so a fresh one is handed out per call
+    // rather than cached; the config it carries is a snapshot of query_config() at the
+    // time of the call.
+    NavigationQuery query() const {
+        if (!nav_mesh_ || !nav_query_)
+            throw std::runtime_error("no map loaded; call load_map() first");
+        return NavigationQuery(nav_mesh_, nav_query_, query_config_, this, generation_);
+    }
+
+    const QueryConfig& query_config() const { return query_config_; }
+    void set_query_config(QueryConfig config) { query_config_ = config; }
 
     // Returns the straight path between start and end as a list of (x, y, z) points
     // in WoW world coordinates. Returns an empty list if no path could be found.
@@ -367,8 +982,10 @@ public:
         if (search_extent <= 0)
             throw std::invalid_argument("search_extent must be positive");
 
-        float s[3] = {std::get<1>(start), std::get<2>(start), std::get<0>(start)};
-        float e[3] = {std::get<1>(end), std::get<2>(end), std::get<0>(end)};
+        float s[3];
+        wowToDetour(start, s);
+        float e[3];
+        wowToDetour(end, e);
         float extents[3] = {search_extent, search_extent, search_extent};
         dtQueryFilter filter;
 
@@ -403,13 +1020,13 @@ public:
         std::vector<Point3> result;
 
         if (centered) {
-            result.emplace_back(start_pt[2], start_pt[0], start_pt[1]);
+            result.push_back(detourToWow(start_pt));
             for (int i = 1; i < path_count; i++) {
                 float mid[3];
                 if (portalMidpoint(nav_mesh_, path_polys[i - 1], path_polys[i], mid))
-                    result.emplace_back(mid[2], mid[0], mid[1]);
+                    result.push_back(detourToWow(mid));
             }
-            result.emplace_back(end_pt[2], end_pt[0], end_pt[1]);
+            result.push_back(detourToWow(end_pt));
         } else {
             std::vector<float> points(static_cast<size_t>(max_points) * 3);
             int point_count = 0;
@@ -421,7 +1038,7 @@ public:
 
             result.reserve(static_cast<size_t>(point_count));
             for (int i = 0; i < point_count; i++)
-                result.emplace_back(points[i * 3 + 2], points[i * 3], points[i * 3 + 1]);
+                result.push_back(detourToWow(&points[i * 3]));
         }
 
         const Point3 actual_end = result.back();
@@ -460,7 +1077,26 @@ private:
     dtNavMesh* nav_mesh_ = nullptr;
     dtNavMeshQuery* nav_query_ = nullptr;
     std::optional<unsigned int> map_id_;
+    QueryConfig query_config_;
+    int generation_ = 0;
 };
+
+// Defined here, now that NavMesh::generation() is available: any NavigationQuery/Path
+// built before the most recent load_map()/free_map() call on its owner is stale, and
+// must refuse to touch the (freed and possibly reallocated) pointers it was built from.
+inline void NavigationQuery::ensureFresh() const {
+    if (!owner_ || owner_->generation() != generation_)
+        throw std::runtime_error(
+            "stale NavigationQuery: the owning NavMesh's map was reloaded or freed since "
+            "this was obtained from NavMesh.query");
+}
+
+inline void Path::ensureFresh() const {
+    if (!owner_ || owner_->generation() != generation_)
+        throw std::runtime_error(
+            "stale Path: the owning NavMesh's map was reloaded or freed since this Path was "
+            "created");
+}
 
 }  // namespace
 
@@ -486,6 +1122,140 @@ NB_MODULE(_wow_navmesh, m) {
                    ")";
         });
 
+    nb::enum_<PathStatus>(m, "PathStatus")
+        .value("SUCCESS", PathStatus::Success, "The path reaches the requested end point.")
+        .value("PARTIAL", PathStatus::Partial,
+               "The path only reaches as close to the end as the navmesh allows.")
+        .value("NO_PATH", PathStatus::NoPath, "No route exists between start and end.")
+        .value("START_NOT_FOUND", PathStatus::StartNotFound, "No polygon found near the start point.")
+        .value("END_NOT_FOUND", PathStatus::EndNotFound, "No polygon found near the end point.")
+        .value("INVALID_START", PathStatus::InvalidStart, "The start polygon reference is invalid.")
+        .value("INVALID_END", PathStatus::InvalidEnd, "The end polygon reference is invalid.")
+        .value("BUFFER_FULL", PathStatus::BufferFull,
+               "The result buffer was too small to hold the full result.")
+        .value("QUERY_FAILED", PathStatus::QueryFailed, "The underlying Detour query failed.");
+
+    nb::class_<QueryFilter>(m, "QueryFilter")
+        .def(nb::init<>())
+        .def_prop_rw("include_flags", &QueryFilter::include_flags, &QueryFilter::set_include_flags)
+        .def_prop_rw("exclude_flags", &QueryFilter::exclude_flags, &QueryFilter::set_exclude_flags)
+        .def("area_cost", &QueryFilter::area_cost, nb::arg("area"))
+        .def("set_area_cost", &QueryFilter::set_area_cost, nb::arg("area"), nb::arg("cost"));
+
+    nb::class_<QueryConfig>(m, "NavMeshQueryConfig")
+        .def(nb::init<>())
+        .def_rw("nearest_poly_extents", &QueryConfig::nearest_poly_extents)
+        .def_rw("max_path_polys", &QueryConfig::max_path_polys)
+        .def_rw("max_straight_path_points", &QueryConfig::max_straight_path_points);
+
+    nb::class_<NearestPolyResult>(m, "NearestPolyResult")
+        .def_ro("found", &NearestPolyResult::found)
+        .def_ro("poly_ref", &NearestPolyResult::poly_ref)
+        .def_ro("position", &NearestPolyResult::position)
+        .def_ro("distance", &NearestPolyResult::distance);
+
+    nb::class_<PolygonPathResult>(m, "PolygonPathResult")
+        .def_ro("status", &PolygonPathResult::status)
+        .def_ro("start_poly", &PolygonPathResult::start_poly)
+        .def_ro("end_poly", &PolygonPathResult::end_poly)
+        .def_ro("polygons", &PolygonPathResult::polygons)
+        .def_ro("reached_end", &PolygonPathResult::reached_end);
+
+    nb::class_<StraightPathPoint>(m, "StraightPathPoint")
+        .def_ro("position", &StraightPathPoint::position)
+        .def_ro("flags", &StraightPathPoint::flags)
+        .def_ro("poly_ref", &StraightPathPoint::poly_ref);
+
+    nb::class_<StraightPathResult>(m, "StraightPathResult")
+        .def_ro("status", &StraightPathResult::status)
+        .def_ro("points", &StraightPathResult::points);
+
+    nb::class_<MoveAlongSurfaceResult>(m, "MoveAlongSurfaceResult")
+        .def_ro("status", &MoveAlongSurfaceResult::status)
+        .def_ro("position", &MoveAlongSurfaceResult::position)
+        .def_ro("visited", &MoveAlongSurfaceResult::visited);
+
+    nb::class_<RaycastResult>(m, "RaycastResult")
+        .def_ro("hit", &RaycastResult::hit)
+        .def_ro("position", &RaycastResult::position)
+        .def_ro("normal", &RaycastResult::normal)
+        .def_ro("t", &RaycastResult::t)
+        .def_ro("path", &RaycastResult::path);
+
+    nb::class_<WallDistanceResult>(m, "WallDistanceResult")
+        .def_ro("distance", &WallDistanceResult::distance)
+        .def_ro("position", &WallDistanceResult::position)
+        .def_ro("normal", &WallDistanceResult::normal);
+
+    nb::class_<SteerTarget>(m, "SteerTarget")
+        .def_ro("position", &SteerTarget::position)
+        .def_ro("poly_ref", &SteerTarget::poly_ref)
+        .def_ro("distance", &SteerTarget::distance)
+        .def_ro("reached", &SteerTarget::reached)
+        .def_ro("off_mesh", &SteerTarget::off_mesh);
+
+    nb::class_<Path>(m, "Path")
+        .def("is_valid", &Path::is_valid)
+        .def("is_complete", &Path::is_complete)
+        .def_prop_ro("status", &Path::status)
+        .def_prop_ro("start_position", &Path::start_position)
+        .def_prop_ro("requested_end_position", &Path::requested_end_position)
+        .def_prop_ro("actual_end_position", &Path::actual_end_position)
+        .def_prop_ro("start_poly", &Path::start_poly)
+        .def_prop_ro("end_poly", &Path::end_poly)
+        .def_prop_ro("polygon_corridor", &Path::polygon_corridor)
+        .def_prop_ro("straight_path", &Path::straight_path)
+        .def("get_steer_target", &Path::get_steer_target, nb::arg("current"),
+             nb::arg("min_target_distance") = 0.5f, nb::arg("max_target_distance") = 6.0f,
+             "Next steering target along this path's corridor from current_position. Returns "
+             "None if the path has no corridor (e.g. NO_PATH). min_target_distance is the "
+             "horizontal radius within which a corner is considered 'reached' and skipped in "
+             "favor of the next one; max_target_distance bounds vertical (y) drift the same way.");
+
+    nb::class_<NavigationQuery>(m, "NavigationQuery")
+        .def("find_nearest_poly", &NavigationQuery::find_nearest_poly, nb::arg("position"),
+             nb::arg("extents") = nb::none(), nb::arg("filter") = nb::none(),
+             "Find the polygon nearest to position, searching within extents (defaults to the "
+             "query's configured nearest_poly_extents).")
+        .def("find_polygon_path", &NavigationQuery::find_polygon_path, nb::arg("start"),
+             nb::arg("end"), nb::arg("filter") = nb::none(), nb::arg("max_polys") = nb::none(),
+             "Raw Detour polygon corridor between start and end. Does not compute a point path.")
+        .def("find_straight_path", &NavigationQuery::find_straight_path, nb::arg("start"),
+             nb::arg("end"), nb::arg("polygons"), nb::arg("filter") = nb::none(),
+             nb::arg("max_points") = nb::none(),
+             "Detour's findStraightPath() over an already-computed polygon corridor.")
+        .def("move_along_surface", &NavigationQuery::move_along_surface, nb::arg("current"),
+             nb::arg("desired"), nb::arg("start_poly"), nb::arg("filter") = nb::none(),
+             nb::arg("max_visited") = nb::none(),
+             "Slide from current toward desired across the walkable surface, without leaving "
+             "the mesh.")
+        .def("raycast", &NavigationQuery::raycast, nb::arg("start"), nb::arg("end"),
+             nb::arg("start_poly") = nb::none(), nb::arg("filter") = nb::none(),
+             nb::arg("max_path") = nb::none(),
+             "Navmesh-surface raycast from start toward end (Detour's raycast, not a "
+             "geometric approximation).")
+        .def("closest_point_on_poly", &NavigationQuery::closest_point_on_poly, nb::arg("poly_ref"),
+             nb::arg("position"),
+             "Closest point to position that lies on poly_ref (may be interior to the "
+             "polygon).")
+        .def("closest_point_on_poly_boundary", &NavigationQuery::closest_point_on_poly_boundary,
+             nb::arg("poly_ref"), nb::arg("position"),
+             "Closest point to position on poly_ref's boundary; equals closest_point_on_poly "
+             "only when position is outside the polygon's xz-bounds.")
+        .def("get_poly_height", &NavigationQuery::get_poly_height, nb::arg("poly_ref"),
+             nb::arg("position"),
+             "Surface height of poly_ref at position, from detail mesh data (most accurate "
+             "height query).")
+        .def("find_distance_to_wall", &NavigationQuery::find_distance_to_wall, nb::arg("position"),
+             nb::arg("start_poly") = nb::none(), nb::arg("max_radius") = 10.0f,
+             nb::arg("filter") = nb::none(),
+             "Distance from position to the nearest navmesh wall within max_radius.")
+        .def("find_path", &NavigationQuery::find_path, nb::arg("start"), nb::arg("end"),
+             nb::arg("filter") = nb::none(), nb::arg("max_polys") = nb::none(), nb::keep_alive<0, 1>(),
+             "Full pipeline: polygon corridor + straight path, bundled into a Path object "
+             "that also supports get_steer_target().")
+        .def_prop_rw("config", &NavigationQuery::config, &NavigationQuery::set_config);
+
     nb::class_<NavMesh>(m, "NavMesh")
         .def(nb::init<std::string>(), nb::arg("mmaps_path"),
              "Create a NavMesh bound to a directory of .mmap/.mmtile files.")
@@ -507,6 +1277,12 @@ NB_MODULE(_wow_navmesh, m) {
         .def_prop_ro("is_loaded", &NavMesh::is_loaded)
         .def_prop_ro("map_id", &NavMesh::map_id)
         .def_prop_ro("mmaps_path", &NavMesh::mmaps_path)
+        .def_prop_ro("query", &NavMesh::query, nb::keep_alive<0, 1>(),
+                     "A NavigationQuery bound to the currently loaded map. Raises RuntimeError "
+                     "if no map is loaded.")
+        .def_prop_rw("query_config", &NavMesh::query_config, &NavMesh::set_query_config,
+                     "Default NavMeshQueryConfig (nearest-poly extents, buffer sizes) used by "
+                     "NavigationQuery methods that aren't given an explicit override.")
         .def(
             "__enter__", [](NavMesh& self) -> NavMesh& { return self; }, nb::rv_policy::reference)
         .def(

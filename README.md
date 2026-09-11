@@ -63,8 +63,152 @@ with wn.NavMesh(r"C:\path\to\mmaps") as nm:
 ```
 
 Coordinates are `(x, y, z)` in WoW world-coordinate order everywhere in this API. The
-`.mmap`/`.mmtile` files store them as `(y, z, x)`; the swap happens internally at the
-`find_path()` boundary, so callers never need to think about it.
+`.mmap`/`.mmtile` files store them as `(y, z, x)`; the swap happens internally (in one
+centralized helper used by every query function), so callers never need to think about it.
+
+## Architecture
+
+```text
+NavMesh              map load/free, tile lifetime
+   │
+   └── NavigationQuery   (.query)  thin wrapper over dtNavMeshQuery
+          │
+          ├── find_nearest_poly, closest_point_on_poly(_boundary), get_poly_height
+          ├── find_polygon_path      -> PolygonPathResult (raw dtPolyRef corridor)
+          ├── find_straight_path     -> StraightPathResult (funnel points + flags)
+          ├── move_along_surface, raycast, find_distance_to_wall
+          └── find_path              -> Path
+                                          ├── polygon_corridor / straight_path
+                                          ├── status (PathStatus)
+                                          └── get_steer_target()  (steering)
+```
+
+`NavMesh.find_path()` (the original, flat API) still works exactly as before, built on
+top of this stack — nothing here is a breaking change. New code that needs the polygon
+corridor, `dtPolyRef`s, a distinguishable failure reason, or a steering target should use
+`nm.query` instead.
+
+### Nearest poly, raw corridor, straight path
+
+```python
+nearest = nm.query.find_nearest_poly((x, y, z), extents=(50, 50, 50))
+if nearest.found:
+    print(nearest.poly_ref, nearest.position, nearest.distance)
+
+corridor = nm.query.find_polygon_path(start, end)
+print(corridor.status, corridor.reached_end, corridor.polygons)
+
+straight = nm.query.find_straight_path(start, end, corridor.polygons)
+for point in straight.points:
+    print(point.position, point.flags, point.poly_ref)
+```
+
+`polygon_path` is the raw Detour polygon chain — no points yet, just `dtPolyRef`s.
+`straight_path` runs Detour's funnel algorithm over that corridor to produce actual
+waypoints, each carrying its polygon and `DT_STRAIGHTPATH_*` flags (start/end/off-mesh).
+
+### `Path` and steering
+
+`nm.query.find_path(start, end)` returns a `Path` — the corridor and straight path from
+one query, plus enough state to ask for a steering target as an agent advances:
+
+```python
+path = nm.query.find_path(start, end)
+print(path.status)              # PathStatus.SUCCESS / PARTIAL / NO_PATH / ...
+print(path.start_poly, path.end_poly)
+print(path.actual_end_position)  # may differ from `end` on a PARTIAL path
+
+position = start
+while not path.is_complete():
+    steer = path.get_steer_target(position)
+    if steer is None or steer.reached:
+        break
+    # This library only tells you *where* to go next -- it never moves anything.
+    # A caller-owned movement layer decides how `position` actually changes, e.g.:
+    #   moved = nm.query.move_along_surface(position, steer.position, path.start_poly)
+    #   position = moved.position
+```
+
+`get_steer_target()` ports the same algorithm AzerothCore's `PathGenerator::GetSteerTarget`
+uses (itself derived from Detour's own `NavMeshTesterTool` sample): it walks the straight
+path looking for the first corner not already within `min_target_distance` of the current
+position, skipping straight to it. `max_target_distance` bounds vertical (y) drift the
+same way the original sample's height tolerance did.
+
+### Partial paths
+
+If a path can't reach the requested destination but gets as close as the navmesh allows,
+that's `PathStatus.PARTIAL`, not an error — `path.actual_end_position` is where it
+actually arrives, `path.requested_end_position` is what you asked for. Callers decide
+what "close enough" means for their use case.
+
+### Query filters
+
+`QueryFilter` wraps `dtQueryFilter` — include/exclude flags and per-area costs, passed to
+any `NavigationQuery` method that takes `filter=`:
+
+```python
+f = wn.QueryFilter()
+f.exclude_flags = 0x01  # exclude polygons flagged, e.g., "water"
+f.set_area_cost(3, 2.5)  # make area 3 twice as expensive to cross
+corridor = nm.query.find_polygon_path(start, end, filter=f)
+```
+
+### Move along surface, raycast, closest point, wall distance
+
+```python
+moved = nm.query.move_along_surface(current, desired, start_poly=nearest.poly_ref)
+hit = nm.query.raycast(start, end)              # Detour's navmesh-surface raycast
+pt = nm.query.closest_point_on_poly(poly_ref, position)
+wall = nm.query.find_distance_to_wall(position, max_radius=10.0)
+```
+
+### `PolyRef`
+
+A `dtPolyRef` is a plain Python `int` everywhere in this API — 64-bit under the
+`DT_POLYREF64` build this project uses by default for TrinityCore/AzerothCore mmaps (see
+below), 32-bit if built with `WOW_NAVMESH_POLYREF64=OFF`. Never assume a fixed width;
+treat it as an opaque handle.
+
+### Thread safety
+
+One `NavigationQuery` (and the `dtNavMeshQuery` behind it) belongs to one `NavMesh`
+instance and is **not** safe to use concurrently from multiple threads — Detour's query
+object carries mutable search state internally. If you need to path-find from multiple
+threads, use a separate `NavMesh` instance per thread (they can point at the same
+`mmaps_path` and `load_map()` the same map id independently; tile data is read-only once
+loaded).
+
+### Map lifecycle
+
+`load_map()` can be called again at any time to switch maps (it frees whatever was
+loaded first), and `free_map()`/the context manager both release cleanly. Any
+`NavigationQuery` or `Path` obtained *before* a `load_map()`/`free_map()` call becomes
+stale the moment that call happens — using it afterwards raises `RuntimeError` rather
+than touching the (by then freed and possibly reallocated) navmesh data:
+
+```python
+q = nm.query
+nm.load_map(1)   # switches map
+q.find_nearest_poly(pos)  # RuntimeError: stale NavigationQuery
+```
+
+Get a fresh `nm.query` (and re-run `find_path()`) after any reload.
+
+### Limitations
+
+- Off-mesh connections are recognized in straight paths and steering targets
+  (`DT_STRAIGHTPATH_OFFMESH_CONNECTION` / `SteerTarget.off_mesh`), but this library
+  doesn't move an agent across one — that decision belongs to a caller-owned movement
+  layer, same as every other steering step. In practice this path is effectively
+  untested: TrinityCore/AzerothCore's mmap generator doesn't emit off-mesh connections at
+  all (verified: 0 across every tile on both Eastern Kingdoms and Kalimdor), so there's
+  nothing in real WoW mmap data to exercise it against.
+- No agent-radius/height reshaping: Detour queries the navmesh as it was generated. A
+  different agent size requires a differently generated navmesh, not a runtime parameter.
+- This is navigation-only: no bot AI, click-to-move, keyboard input, character movement,
+  or combat logic. It answers "where is the next useful point on the navmesh," never
+  "move the character there."
 
 ## API
 
@@ -81,6 +225,30 @@ Coordinates are `(x, y, z)` in WoW world-coordinate order everywhere in this API
     navmesh. Increase for looser matching, decrease for tighter precision.
   - Raises `RuntimeError` if no map is loaded, `ValueError` if arguments are invalid.
 - `.is_loaded`, `.map_id`, `.mmaps_path` — read-only properties.
+- `.query -> NavigationQuery` — bound to the currently loaded map. Raises `RuntimeError`
+  if no map is loaded.
+- `.query_config: NavMeshQueryConfig` — defaults (`nearest_poly_extents`,
+  `max_path_polys`, `max_straight_path_points`) used by `NavigationQuery` methods that
+  aren't given an explicit override.
+
+`NavigationQuery` methods (see [Architecture](#architecture) above for the full picture):
+
+- `.find_nearest_poly(position, extents=None, filter=None) -> NearestPolyResult`
+- `.find_polygon_path(start, end, filter=None, max_polys=None) -> PolygonPathResult`
+- `.find_straight_path(start, end, polygons, filter=None, max_points=None) -> StraightPathResult`
+- `.move_along_surface(current, desired, start_poly, filter=None, max_visited=None) -> MoveAlongSurfaceResult`
+- `.raycast(start, end, start_poly=None, filter=None, max_path=None) -> RaycastResult`
+- `.closest_point_on_poly(poly_ref, position) -> (x, y, z)`
+- `.closest_point_on_poly_boundary(poly_ref, position) -> (x, y, z)`
+- `.get_poly_height(poly_ref, position) -> float`
+- `.find_distance_to_wall(position, start_poly=None, max_radius=10.0, filter=None) -> WallDistanceResult`
+- `.find_path(start, end, filter=None, max_polys=None) -> Path`
+- `.config: NavMeshQueryConfig`
+
+`Path` methods/properties: `.is_valid()`, `.is_complete()`, `.status`,
+`.start_position`, `.requested_end_position`, `.actual_end_position`, `.start_poly`,
+`.end_poly`, `.polygon_corridor`, `.straight_path`,
+`.get_steer_target(current, min_target_distance=0.5, max_target_distance=6.0) -> SteerTarget | None`.
 
 Full type stubs ship with the package (`py.typed`).
 
@@ -126,8 +294,8 @@ required — Detour's sources are vendored as a git submodule under
 `extern/recastnavigation/`, pinned to upstream tag `v1.6.0`.
 
 Run the tests with `pip install pytest && pytest`. A second tier of tests exercises
-`find_path()` against a real mmaps directory; point `WOW_NAVMESH_TEST_MMAPS` at one to
-enable it:
+`find_path()` and the `NavigationQuery`/`Path` API against a real mmaps directory; point
+`WOW_NAVMESH_TEST_MMAPS` at one to enable it:
 
 ```powershell
 $env:WOW_NAVMESH_TEST_MMAPS = "C:\path\to\mmaps"
@@ -138,9 +306,9 @@ pytest
 
 - Only verified against TrinityCore/AzerothCore mmaps for WoW 3.3.5a. The mmap format
   may differ across core versions or forks; nothing here has been tested against those.
-- The internal path-buffer size (512 polygons) used by `find_path()` is currently fixed,
-  not configurable. This is rarely a limitation in practice (paths over navmeshes rarely
-  exceed ~100 polygons).
+- `NavMesh.find_path()`'s internal path-buffer size (512 polygons) is still fixed, for
+  backward compatibility with its original signature. `nm.query.find_path()` (or
+  `nm.query_config.max_path_polys`) is configurable and should be preferred for new code.
 - License: TBD (recastnavigation/Detour itself is zlib-licensed; its notice is included
   under `extern/recastnavigation/`).
 

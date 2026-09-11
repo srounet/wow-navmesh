@@ -59,6 +59,11 @@ execute_process(
 list(APPEND CMAKE_PREFIX_PATH "${NB_DIR}")
 find_package(nanobind CONFIG REQUIRED)
 
+# dtPathCorridor (DetourCrowd/) is a standalone corridor/steering utility used by Path's
+# get_steer_target() -- not the dtCrowd multi-agent simulation, which this project does
+# not use. It depends only on Detour core, not on DetourCrowd.cpp itself.
+set(DETOUR_CROWD_SOURCE_DIR "${PROJECT_SOURCE_DIR}/extern/recastnavigation/DetourCrowd")
+
 nanobind_add_module(
   _wow_navmesh
   src/bindings.cpp
@@ -69,9 +74,13 @@ nanobind_add_module(
   "${DETOUR_SOURCE_DIR}/Source/DetourNavMeshBuilder.cpp"
   "${DETOUR_SOURCE_DIR}/Source/DetourNavMeshQuery.cpp"
   "${DETOUR_SOURCE_DIR}/Source/DetourNode.cpp"
+  "${DETOUR_CROWD_SOURCE_DIR}/Source/DetourPathCorridor.cpp"
 )
 
-target_include_directories(_wow_navmesh PRIVATE "${DETOUR_SOURCE_DIR}/Include")
+target_include_directories(_wow_navmesh PRIVATE
+  "${DETOUR_SOURCE_DIR}/Include"
+  "${DETOUR_CROWD_SOURCE_DIR}/Include"
+)
 
 if (WOW_NAVMESH_POLYREF64)
   target_compile_definitions(_wow_navmesh PRIVATE DT_POLYREF64 WOW_NAVMESH_POLYREF64=1)
