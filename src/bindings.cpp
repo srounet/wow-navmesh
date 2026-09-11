@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "DetourCommon.h"
@@ -329,6 +330,133 @@ struct SteerTarget {
     bool off_mesh = false;
 };
 
+// Detour's DT_POLYTYPE_* poly kinds, exposed as-is: a standard walkable polygon vs. an
+// off-mesh connection (jump/teleport/etc.) represented as a 2-vertex "polygon".
+enum class PolyType {
+    Ground = 0,
+    OffMeshConnection = 1,
+};
+
+// Raw structural data for one dtPoly, enough to inspect a polygon from Python without
+// touching Detour directly. center is the vertex centroid -- Detour has no dedicated
+// per-poly center function, and centroid is well-defined for both ground polygons and
+// the 2-vertex off-mesh connection "polygons" (their centroid is just the midpoint).
+struct PolyInfo {
+    dtPolyRef ref = 0;
+    PolyType type = PolyType::Ground;
+    unsigned short flags = 0;
+    unsigned char area = 0;
+    Point3 center{0.0f, 0.0f, 0.0f};
+    std::vector<Point3> vertices;
+    std::vector<dtPolyRef> neighbors;
+    int tile_x = 0;
+    int tile_y = 0;
+    int tile_layer = 0;
+};
+
+// Structural data for one loaded dtMeshTile. uses_liquids comes from TrinityCore/
+// AzerothCore's own MmapTileHeader (not part of Detour's dtMeshHeader) -- it describes
+// the tile's liquid handling, not any individual polygon's area/flags.
+struct TileInfo {
+    int x = 0;
+    int y = 0;
+    int layer = 0;
+    Point3 bounds_min{0.0f, 0.0f, 0.0f};
+    Point3 bounds_max{0.0f, 0.0f, 0.0f};
+    int poly_count = 0;
+    bool uses_liquids = false;
+};
+
+// Raw dtOffMeshConnection data. flags/area come from the connection's own dtPoly --
+// dtOffMeshConnection::flags itself is documented upstream as internal link bookkeeping,
+// not the connection's user-defined flags.
+struct OffMeshConnection {
+    dtPolyRef ref = 0;
+    Point3 start{0.0f, 0.0f, 0.0f};
+    Point3 end{0.0f, 0.0f, 0.0f};
+    float radius = 0.0f;
+    unsigned short flags = 0;
+    unsigned char area = 0;
+    bool bidirectional = false;
+};
+
+inline Point3 polyCentroid(const dtMeshTile* tile, const dtPoly* poly) {
+    float sum[3] = {0.0f, 0.0f, 0.0f};
+    const int n = poly->vertCount;
+    for (int i = 0; i < n; i++) {
+        const float* v = &tile->verts[poly->verts[i] * 3];
+        sum[0] += v[0];
+        sum[1] += v[1];
+        sum[2] += v[2];
+    }
+    if (n > 0) {
+        sum[0] /= n;
+        sum[1] /= n;
+        sum[2] /= n;
+    }
+    return detourToWow(sum);
+}
+
+inline std::vector<Point3> polyVertices(const dtMeshTile* tile, const dtPoly* poly) {
+    std::vector<Point3> verts;
+    verts.reserve(poly->vertCount);
+    for (int i = 0; i < poly->vertCount; i++)
+        verts.push_back(detourToWow(&tile->verts[poly->verts[i] * 3]));
+    return verts;
+}
+
+// Walks only resolved links (the chain is terminated by DT_NULL_LINK), so unconnected
+// edges (neis[i] == 0, i.e. mesh border) never show up here -- no extra filtering needed.
+inline std::vector<dtPolyRef> polyNeighbors(const dtMeshTile* tile, const dtPoly* poly) {
+    std::vector<dtPolyRef> neighbors;
+    for (unsigned int i = poly->firstLink; i != DT_NULL_LINK; i = tile->links[i].next)
+        if (tile->links[i].ref)
+            neighbors.push_back(tile->links[i].ref);
+    return neighbors;
+}
+
+inline PolyInfo buildPolyInfo(dtPolyRef ref, const dtMeshTile* tile, const dtPoly* poly) {
+    PolyInfo info;
+    info.ref = ref;
+    info.type = poly->getType() == DT_POLYTYPE_GROUND ? PolyType::Ground : PolyType::OffMeshConnection;
+    info.flags = poly->flags;
+    info.area = poly->getArea();
+    info.center = polyCentroid(tile, poly);
+    info.vertices = polyVertices(tile, poly);
+    info.neighbors = polyNeighbors(tile, poly);
+    info.tile_x = tile->header->x;
+    info.tile_y = tile->header->y;
+    info.tile_layer = tile->header->layer;
+    return info;
+}
+
+inline TileInfo buildTileInfo(const dtMeshTile* tile, bool uses_liquids) {
+    TileInfo info;
+    const dtMeshHeader* h = tile->header;
+    info.x = h->x;
+    info.y = h->y;
+    info.layer = h->layer;
+    info.bounds_min = detourToWow(h->bmin);
+    info.bounds_max = detourToWow(h->bmax);
+    info.poly_count = h->polyCount;
+    info.uses_liquids = uses_liquids;
+    return info;
+}
+
+inline OffMeshConnection buildOffMeshConnection(const dtNavMesh* mesh, const dtMeshTile* tile, int index) {
+    const dtOffMeshConnection& con = tile->offMeshCons[index];
+    const dtPoly& poly = tile->polys[tile->header->offMeshBase + index];
+    OffMeshConnection info;
+    info.ref = mesh->getPolyRefBase(tile) + static_cast<dtPolyRef>(tile->header->offMeshBase + index);
+    info.start = detourToWow(&con.pos[0]);
+    info.end = detourToWow(&con.pos[3]);
+    info.radius = con.rad;
+    info.flags = poly.flags;
+    info.area = poly.getArea();
+    info.bidirectional = (con.flags & DT_OFFMESH_CON_BIDIR) != 0;
+    return info;
+}
+
 class Path;    // forward decl; defined after NavigationQuery, which builds it.
 class NavMesh; // forward decl; NavigationQuery/Path only need it to detect a reload/free
                // that has invalidated the raw pointers they were built from.
@@ -616,6 +744,143 @@ public:
         return result;
     }
 
+    // World-navigation introspection: raw dtPoly/dtMeshTile/dtOffMeshConnection data for
+    // Python, without exposing Detour pointers. Never throws for an invalid/stale
+    // poly_ref -- returns None (or an empty list) instead, since callers are expected to
+    // probe refs of unknown/expired provenance (e.g. from a previous map generation).
+    std::optional<PolyInfo> get_poly(dtPolyRef ref) const {
+        ensureFresh();
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+            return std::nullopt;
+        return buildPolyInfo(ref, tile, poly);
+    }
+
+    std::optional<PolyType> get_poly_type(dtPolyRef ref) const {
+        ensureFresh();
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+            return std::nullopt;
+        return poly->getType() == DT_POLYTYPE_GROUND ? PolyType::Ground : PolyType::OffMeshConnection;
+    }
+
+    std::optional<int> get_poly_area(dtPolyRef ref) const {
+        ensureFresh();
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+            return std::nullopt;
+        return static_cast<int>(poly->getArea());
+    }
+
+    std::optional<int> get_poly_flags(dtPolyRef ref) const {
+        ensureFresh();
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+            return std::nullopt;
+        return static_cast<int>(poly->flags);
+    }
+
+    std::optional<Point3> get_poly_center(dtPolyRef ref) const {
+        ensureFresh();
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+            return std::nullopt;
+        return polyCentroid(tile, poly);
+    }
+
+    std::vector<Point3> get_poly_vertices(dtPolyRef ref) const {
+        ensureFresh();
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+            return {};
+        return polyVertices(tile, poly);
+    }
+
+    std::vector<dtPolyRef> get_poly_neighbors(dtPolyRef ref) const {
+        ensureFresh();
+        const dtMeshTile* tile = nullptr;
+        const dtPoly* poly = nullptr;
+        if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+            return {};
+        return polyNeighbors(tile, poly);
+    }
+
+    // Declared here, defined after NavMesh (below) since it needs owner_->tileUsesLiquids()
+    // (a NavMesh method) to be a complete-type call.
+    std::optional<TileInfo> get_tile_info(dtPolyRef ref) const;
+
+    std::vector<PolyInfo> get_tile_polys(int tile_x, int tile_y, int tile_layer) const {
+        ensureFresh();
+        const dtMeshTile* tile = mesh_->getTileAt(tile_x, tile_y, tile_layer);
+        std::vector<PolyInfo> result;
+        if (!tile || !tile->header)
+            return result;
+        const dtPolyRef base = mesh_->getPolyRefBase(tile);
+        result.reserve(static_cast<std::size_t>(tile->header->polyCount));
+        for (int i = 0; i < tile->header->polyCount; i++)
+            result.push_back(buildPolyInfo(base + static_cast<dtPolyRef>(i), tile, &tile->polys[i]));
+        return result;
+    }
+
+    // Leaving both tile_x/tile_y unset enumerates every loaded tile's connections.
+    std::vector<OffMeshConnection> get_offmesh_connections(std::optional<int> tile_x,
+                                                             std::optional<int> tile_y,
+                                                             int tile_layer) const {
+        ensureFresh();
+        std::vector<OffMeshConnection> result;
+        auto collect = [&](const dtMeshTile* tile) {
+            if (!tile || !tile->header)
+                return;
+            for (int i = 0; i < tile->header->offMeshConCount; i++)
+                result.push_back(buildOffMeshConnection(mesh_, tile, i));
+        };
+        if (tile_x.has_value() && tile_y.has_value()) {
+            collect(mesh_->getTileAt(*tile_x, *tile_y, tile_layer));
+            return result;
+        }
+        const dtNavMesh* mesh = mesh_;
+        for (int i = 0; i < mesh->getMaxTiles(); i++)
+            collect(mesh->getTile(i));
+        return result;
+    }
+
+    // Box query around center using Detour's own BV-tree-accelerated queryPolygons --
+    // not a linear scan over every polygon in the mesh.
+    std::vector<PolyInfo> sample_polys(Point3 center, float radius, const QueryFilter* filter,
+                                        std::optional<int> max_polys) const {
+        ensureFresh();
+        if (radius <= 0)
+            throw std::invalid_argument("radius must be positive");
+        const int maxPolys = max_polys.value_or(128);
+        if (maxPolys <= 0)
+            throw std::invalid_argument("max_polys must be positive");
+        const dtQueryFilter defaultFilter;
+        const dtQueryFilter* f = filter ? &filter->raw() : &defaultFilter;
+        float c[3];
+        wowToDetour(center, c);
+        float ext[3] = {radius, radius, radius};
+        std::vector<dtPolyRef> refs(static_cast<std::size_t>(maxPolys));
+        int count = 0;
+        dtStatus st = query_->queryPolygons(c, ext, f, refs.data(), &count, maxPolys);
+        std::vector<PolyInfo> result;
+        if (dtStatusFailed(st))
+            return result;
+        result.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; i++) {
+            const dtMeshTile* tile = nullptr;
+            const dtPoly* poly = nullptr;
+            if (dtStatusSucceed(mesh_->getTileAndPolyByRef(refs[i], &tile, &poly)))
+                result.push_back(buildPolyInfo(refs[i], tile, poly));
+        }
+        return result;
+    }
+
     // High-level convenience: polygon corridor + straight path + steering state, bundled
     // into one Path object instead of a bare point list.
     Path find_path(Point3 start, Point3 end, const QueryFilter* filter,
@@ -898,6 +1163,9 @@ public:
 
                 checkTileLayout(tile_path_str, data.get(), header.size);
 
+                tile_uses_liquids_[tileKey(static_cast<int>(x), static_cast<int>(y))] =
+                    header.usesLiquids;
+
                 dtStatus status =
                     mesh->addTile(data.get(), static_cast<int>(header.size), DT_TILE_FREE_DATA, 0, nullptr);
                 if (dtStatusFailed(status))
@@ -938,10 +1206,32 @@ public:
             nav_mesh_ = nullptr;
         }
         map_id_.reset();
+        tile_uses_liquids_.clear();
         generation_++;
     }
 
     int generation() const { return generation_; }
+
+    // uses_liquids is TrinityCore/AzerothCore's own per-tile MmapTileHeader flag, not
+    // part of Detour's dtMeshHeader -- tracked separately here, keyed by tile grid coords.
+    bool tileUsesLiquids(int x, int y) const {
+        const auto it = tile_uses_liquids_.find(tileKey(x, y));
+        return it != tile_uses_liquids_.end() && it->second;
+    }
+
+    std::vector<TileInfo> get_loaded_tiles() const {
+        if (!nav_mesh_)
+            throw std::runtime_error("no map loaded; call load_map() first");
+        std::vector<TileInfo> result;
+        const dtNavMesh* mesh = nav_mesh_;
+        for (int i = 0; i < mesh->getMaxTiles(); i++) {
+            const dtMeshTile* tile = mesh->getTile(i);
+            if (!tile || !tile->header)
+                continue;
+            result.push_back(buildTileInfo(tile, tileUsesLiquids(tile->header->x, tile->header->y)));
+        }
+        return result;
+    }
 
     bool is_loaded() const { return nav_mesh_ != nullptr; }
 
@@ -1073,11 +1363,17 @@ public:
     }
 
 private:
+    static std::uint64_t tileKey(int x, int y) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
+               static_cast<std::uint32_t>(y);
+    }
+
     std::string mmaps_path_;
     dtNavMesh* nav_mesh_ = nullptr;
     dtNavMeshQuery* nav_query_ = nullptr;
     std::optional<unsigned int> map_id_;
     QueryConfig query_config_;
+    std::unordered_map<std::uint64_t, bool> tile_uses_liquids_;
     int generation_ = 0;
 };
 
@@ -1096,6 +1392,15 @@ inline void Path::ensureFresh() const {
         throw std::runtime_error(
             "stale Path: the owning NavMesh's map was reloaded or freed since this Path was "
             "created");
+}
+
+inline std::optional<TileInfo> NavigationQuery::get_tile_info(dtPolyRef ref) const {
+    ensureFresh();
+    const dtMeshTile* tile = nullptr;
+    const dtPoly* poly = nullptr;
+    if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
+        return std::nullopt;
+    return buildTileInfo(tile, owner_->tileUsesLiquids(tile->header->x, tile->header->y));
 }
 
 }  // namespace
@@ -1187,6 +1492,42 @@ NB_MODULE(_wow_navmesh, m) {
         .def_ro("position", &WallDistanceResult::position)
         .def_ro("normal", &WallDistanceResult::normal);
 
+    nb::enum_<PolyType>(m, "PolyType")
+        .value("GROUND", PolyType::Ground,
+               "A standard convex walkable polygon that is part of the mesh surface.")
+        .value("OFFMESH_CONNECTION", PolyType::OffMeshConnection,
+               "A 2-vertex off-mesh connection (jump/teleport/etc.).");
+
+    nb::class_<PolyInfo>(m, "PolyInfo")
+        .def_ro("ref", &PolyInfo::ref)
+        .def_ro("type", &PolyInfo::type)
+        .def_ro("flags", &PolyInfo::flags)
+        .def_ro("area", &PolyInfo::area)
+        .def_ro("center", &PolyInfo::center)
+        .def_ro("vertices", &PolyInfo::vertices)
+        .def_ro("neighbors", &PolyInfo::neighbors)
+        .def_ro("tile_x", &PolyInfo::tile_x)
+        .def_ro("tile_y", &PolyInfo::tile_y)
+        .def_ro("tile_layer", &PolyInfo::tile_layer);
+
+    nb::class_<TileInfo>(m, "TileInfo")
+        .def_ro("x", &TileInfo::x)
+        .def_ro("y", &TileInfo::y)
+        .def_ro("layer", &TileInfo::layer)
+        .def_ro("bounds_min", &TileInfo::bounds_min)
+        .def_ro("bounds_max", &TileInfo::bounds_max)
+        .def_ro("poly_count", &TileInfo::poly_count)
+        .def_ro("uses_liquids", &TileInfo::uses_liquids);
+
+    nb::class_<OffMeshConnection>(m, "OffMeshConnection")
+        .def_ro("ref", &OffMeshConnection::ref)
+        .def_ro("start", &OffMeshConnection::start)
+        .def_ro("end", &OffMeshConnection::end)
+        .def_ro("radius", &OffMeshConnection::radius)
+        .def_ro("flags", &OffMeshConnection::flags)
+        .def_ro("area", &OffMeshConnection::area)
+        .def_ro("bidirectional", &OffMeshConnection::bidirectional);
+
     nb::class_<SteerTarget>(m, "SteerTarget")
         .def_ro("position", &SteerTarget::position)
         .def_ro("poly_ref", &SteerTarget::poly_ref)
@@ -1254,6 +1595,31 @@ NB_MODULE(_wow_navmesh, m) {
              nb::arg("filter") = nb::none(), nb::arg("max_polys") = nb::none(), nb::keep_alive<0, 1>(),
              "Full pipeline: polygon corridor + straight path, bundled into a Path object "
              "that also supports get_steer_target().")
+        .def("get_poly", &NavigationQuery::get_poly, nb::arg("poly_ref"),
+             "Raw structural data (type/flags/area/center/vertices/neighbors/tile) for "
+             "poly_ref, or None if it's not a currently valid polygon reference.")
+        .def("get_poly_type", &NavigationQuery::get_poly_type, nb::arg("poly_ref"))
+        .def("get_poly_area", &NavigationQuery::get_poly_area, nb::arg("poly_ref"))
+        .def("get_poly_flags", &NavigationQuery::get_poly_flags, nb::arg("poly_ref"))
+        .def("get_poly_center", &NavigationQuery::get_poly_center, nb::arg("poly_ref"))
+        .def("get_poly_vertices", &NavigationQuery::get_poly_vertices, nb::arg("poly_ref"),
+             "Polygon vertices in WoW (x, y, z) order. Empty list if poly_ref is invalid.")
+        .def("get_poly_neighbors", &NavigationQuery::get_poly_neighbors, nb::arg("poly_ref"),
+             "PolyRefs of polygons reachable across this polygon's edges. Empty list if "
+             "poly_ref is invalid.")
+        .def("get_tile_info", &NavigationQuery::get_tile_info, nb::arg("poly_ref"),
+             "TileInfo for the tile containing poly_ref, or None if poly_ref is invalid.")
+        .def("get_tile_polys", &NavigationQuery::get_tile_polys, nb::arg("tile_x"), nb::arg("tile_y"),
+             nb::arg("tile_layer") = 0,
+             "Every PolyInfo in the given tile. Empty list if no such tile is loaded.")
+        .def("get_offmesh_connections", &NavigationQuery::get_offmesh_connections,
+             nb::arg("tile_x") = nb::none(), nb::arg("tile_y") = nb::none(), nb::arg("tile_layer") = 0,
+             "Off-mesh connections in the given tile, or across every loaded tile if "
+             "tile_x/tile_y are omitted.")
+        .def("sample_polys", &NavigationQuery::sample_polys, nb::arg("center"), nb::arg("radius"),
+             nb::arg("filter") = nb::none(), nb::arg("max_polys") = nb::none(),
+             "PolyInfo for every polygon within radius of center (an axis-aligned box "
+             "query, not an exact circle).")
         .def_prop_rw("config", &NavigationQuery::config, &NavigationQuery::set_config);
 
     nb::class_<NavMesh>(m, "NavMesh")
@@ -1274,6 +1640,9 @@ NB_MODULE(_wow_navmesh, m) {
              "midpoints instead of the shortest-path funnel, trading a longer/less direct "
              "path for staying away from walls (max_points is ignored in this mode). "
              "Raises RuntimeError if no map is loaded.")
+        .def("get_loaded_tiles", &NavMesh::get_loaded_tiles,
+             "TileInfo for every currently loaded tile. Raises RuntimeError if no map is "
+             "loaded.")
         .def_prop_ro("is_loaded", &NavMesh::is_loaded)
         .def_prop_ro("map_id", &NavMesh::map_id)
         .def_prop_ro("mmaps_path", &NavMesh::mmaps_path)

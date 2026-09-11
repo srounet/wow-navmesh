@@ -71,16 +71,20 @@ centralized helper used by every query function), so callers never need to think
 ```text
 NavMesh              map load/free, tile lifetime
    │
+   ├── get_loaded_tiles()  -> list[TileInfo]
+   │
    └── NavigationQuery   (.query)  thin wrapper over dtNavMeshQuery
           │
           ├── find_nearest_poly, closest_point_on_poly(_boundary), get_poly_height
           ├── find_polygon_path      -> PolygonPathResult (raw dtPolyRef corridor)
           ├── find_straight_path     -> StraightPathResult (funnel points + flags)
           ├── move_along_surface, raycast, find_distance_to_wall
-          └── find_path              -> Path
-                                          ├── polygon_corridor / straight_path
-                                          ├── status (PathStatus)
-                                          └── get_steer_target()  (steering)
+          ├── find_path              -> Path
+          │                             ├── polygon_corridor / straight_path
+          │                             ├── status (PathStatus)
+          │                             └── get_steer_target()  (steering)
+          └── introspection: get_poly(_area|_flags|_type|_center|_vertices|_neighbors),
+              get_tile_info, get_tile_polys, get_offmesh_connections, sample_polys
 ```
 
 `NavMesh.find_path()` (the original, flat API) still works exactly as before, built on
@@ -163,6 +167,94 @@ pt = nm.query.closest_point_on_poly(poly_ref, position)
 wall = nm.query.find_distance_to_wall(position, max_radius=10.0)
 ```
 
+## World Navigation / NavMesh Introspection
+
+Beyond pathfinding, `NavigationQuery` exposes the raw structural data behind the
+navmesh — polygons, tiles, and off-mesh connections — so Python can inspect the world
+without touching Detour directly. This is deliberately **raw NavMesh data**: `area`,
+`flags`, and geometry don't by themselves mean "road", "water", "building", or "city".
+Building that kind of semantic classification on top (e.g. a `WorldAnalyzer`) is a job
+for a separate layer — this library only guarantees the data is there to build one from.
+
+### Inspecting a polygon
+
+```python
+nearest = nm.query.find_nearest_poly(position)
+poly = nm.query.get_poly(nearest.poly_ref)
+
+if poly:
+    print(poly.type)       # PolyType.GROUND or PolyType.OFFMESH_CONNECTION
+    print(poly.area)
+    print(poly.flags)
+    print(poly.center)     # vertex centroid, WoW (x, y, z)
+    print(poly.vertices)   # list[(x, y, z)]
+    print(poly.neighbors)  # list[PolyRef] reachable across this poly's edges
+```
+
+`get_poly()` returns `None` — never raises — for `0`, a garbage `dtPolyRef`, or a ref
+from a map generation that's since been reloaded/freed (see
+[Map lifecycle](#map-lifecycle)). Lean single-field wrappers avoid building the whole
+`PolyInfo` when only one value is needed:
+
+```python
+area = nm.query.get_poly_area(poly_ref)        # int | None
+flags = nm.query.get_poly_flags(poly_ref)      # int | None
+kind = nm.query.get_poly_type(poly_ref)        # PolyType | None
+center = nm.query.get_poly_center(poly_ref)    # (x, y, z) | None
+verts = nm.query.get_poly_vertices(poly_ref)   # list[(x, y, z)], [] if invalid
+neighbors = nm.query.get_poly_neighbors(poly_ref)  # list[PolyRef], [] if invalid
+```
+
+### Inspecting tiles
+
+```python
+for tile in nm.get_loaded_tiles():
+    print(tile.x, tile.y, tile.poly_count, tile.uses_liquids)
+```
+
+`tile.uses_liquids` is TrinityCore/AzerothCore's own per-tile mmap flag (from
+`MmapTileHeader`, not part of Detour itself) — it describes the tile's liquid handling,
+**not** a per-polygon `poly.is_water`.
+
+Fetching every polygon in a tile in one call avoids per-polygon round trips when
+scanning the whole mesh:
+
+```python
+for tile in nm.get_loaded_tiles():
+    for poly in nm.query.get_tile_polys(tile.x, tile.y, tile.layer):
+        print(poly.ref, poly.area, poly.flags)
+```
+
+### Off-mesh connections
+
+`dtOffMeshConnection`s (jumps, ferries, teleporters, doors, or any other special
+traversal the mmap generator emitted) are exposed as raw data — no semantics attached:
+
+```python
+for conn in nm.query.get_offmesh_connections():
+    print(conn.start, conn.end, conn.radius, conn.bidirectional)
+
+# Or scoped to one tile:
+connections = nm.query.get_offmesh_connections(tile.x, tile.y, tile.layer)
+```
+
+See [Limitations](#limitations) — TrinityCore/AzerothCore's mmap generator doesn't
+currently emit any, so this is untested against real data.
+
+### Sampling an area
+
+`sample_polys()` finds every polygon within a box around a point, using Detour's own
+BV-tree-accelerated `queryPolygons` rather than a linear scan over the mesh:
+
+```python
+nearby = nm.query.sample_polys(position, radius=30.0)
+for poly in nearby:
+    print(poly.area, poly.flags, poly.center)
+```
+
+The `radius` bounds an axis-aligned box, not an exact circle — polygons slightly beyond
+`radius` at the corners of that box can be included.
+
 ### `PolyRef`
 
 A `dtPolyRef` is a plain Python `int` everywhere in this API — 64-bit under the
@@ -209,6 +301,8 @@ Get a fresh `nm.query` (and re-run `find_path()`) after any reload.
 - This is navigation-only: no bot AI, click-to-move, keyboard input, character movement,
   or combat logic. It answers "where is the next useful point on the navmesh," never
   "move the character there."
+- No WoW-specific semantics: `area`/`flags` are raw NavMesh data. Classifying them as
+  "road", "water", "building", etc. is intentionally left to a layer built on top.
 
 ## API
 
@@ -230,6 +324,8 @@ Get a fresh `nm.query` (and re-run `find_path()`) after any reload.
 - `.query_config: NavMeshQueryConfig` — defaults (`nearest_poly_extents`,
   `max_path_polys`, `max_straight_path_points`) used by `NavigationQuery` methods that
   aren't given an explicit override.
+- `.get_loaded_tiles() -> list[TileInfo]` — every currently loaded tile. Raises
+  `RuntimeError` if no map is loaded.
 
 `NavigationQuery` methods (see [Architecture](#architecture) above for the full picture):
 
@@ -243,6 +339,17 @@ Get a fresh `nm.query` (and re-run `find_path()`) after any reload.
 - `.get_poly_height(poly_ref, position) -> float`
 - `.find_distance_to_wall(position, start_poly=None, max_radius=10.0, filter=None) -> WallDistanceResult`
 - `.find_path(start, end, filter=None, max_polys=None) -> Path`
+- `.get_poly(poly_ref) -> PolyInfo | None`
+- `.get_poly_type(poly_ref) -> PolyType | None`
+- `.get_poly_area(poly_ref) -> int | None`
+- `.get_poly_flags(poly_ref) -> int | None`
+- `.get_poly_center(poly_ref) -> (x, y, z) | None`
+- `.get_poly_vertices(poly_ref) -> list[(x, y, z)]`
+- `.get_poly_neighbors(poly_ref) -> list[PolyRef]`
+- `.get_tile_info(poly_ref) -> TileInfo | None`
+- `.get_tile_polys(tile_x, tile_y, tile_layer=0) -> list[PolyInfo]`
+- `.get_offmesh_connections(tile_x=None, tile_y=None, tile_layer=0) -> list[OffMeshConnection]`
+- `.sample_polys(center, radius, filter=None, max_polys=None) -> list[PolyInfo]`
 - `.config: NavMeshQueryConfig`
 
 `Path` methods/properties: `.is_valid()`, `.is_complete()`, `.status`,

@@ -107,6 +107,56 @@ class SteerTarget:
     reached: bool
     off_mesh: bool
 
+class PolyType(Enum):
+    GROUND = 0
+    """A standard convex walkable polygon that is part of the mesh surface."""
+    OFFMESH_CONNECTION = 1
+    """A 2-vertex off-mesh connection (jump/teleport/etc.)."""
+
+class PolyInfo:
+    """Raw structural data for one dtPoly. area/flags/geometry are raw NavMesh data --
+    they don't by themselves mean "road", "water", "building", etc.; that classification
+    is left to a layer built on top of this API."""
+
+    ref: PolyRef
+    type: PolyType
+    flags: int
+    area: int
+    center: Point3
+    """Vertex centroid (Detour has no dedicated per-poly center function)."""
+    vertices: list[Point3]
+    neighbors: list[PolyRef]
+    """PolyRefs of polygons reachable across this polygon's edges (unconnected/border
+    edges are never included)."""
+    tile_x: int
+    tile_y: int
+    tile_layer: int
+
+class TileInfo:
+    """Structural data for one loaded dtMeshTile."""
+
+    x: int
+    y: int
+    layer: int
+    bounds_min: Point3
+    bounds_max: Point3
+    poly_count: int
+    uses_liquids: bool
+    """Whether this tile's mmap data handles liquids -- a tile-level flag, not a
+    per-polygon "is water" classification."""
+
+class OffMeshConnection:
+    """Raw dtOffMeshConnection data (jump/ferry/teleporter/door/etc. -- no WoW-specific
+    semantics attached)."""
+
+    ref: PolyRef
+    start: Point3
+    end: Point3
+    radius: float
+    flags: int
+    area: int
+    bidirectional: bool
+
 class Path:
     """A polygon corridor + straight path bundled with enough state to steer along it."""
 
@@ -192,6 +242,36 @@ class NavigationQuery:
         filter: QueryFilter | None = None,
         max_polys: int | None = None,
     ) -> Path: ...
+    def get_poly(self, poly_ref: PolyRef) -> PolyInfo | None: ...
+    def get_poly_type(self, poly_ref: PolyRef) -> PolyType | None: ...
+    def get_poly_area(self, poly_ref: PolyRef) -> int | None: ...
+    def get_poly_flags(self, poly_ref: PolyRef) -> int | None: ...
+    def get_poly_center(self, poly_ref: PolyRef) -> Point3 | None: ...
+    def get_poly_vertices(self, poly_ref: PolyRef) -> list[Point3]: ...
+    def get_poly_neighbors(self, poly_ref: PolyRef) -> list[PolyRef]: ...
+    def get_tile_info(self, poly_ref: PolyRef) -> TileInfo | None: ...
+    def get_tile_polys(
+        self, tile_x: int, tile_y: int, tile_layer: int = 0
+    ) -> list[PolyInfo]: ...
+    def get_offmesh_connections(
+        self,
+        tile_x: int | None = None,
+        tile_y: int | None = None,
+        tile_layer: int = 0,
+    ) -> list[OffMeshConnection]:
+        """All off-mesh connections in the given tile, or across every loaded tile if
+        tile_x/tile_y are omitted."""
+        ...
+    def sample_polys(
+        self,
+        center: Point3,
+        radius: float,
+        filter: QueryFilter | None = None,
+        max_polys: int | None = None,
+    ) -> list[PolyInfo]:
+        """PolyInfo for every polygon within radius of center (an axis-aligned box query,
+        not an exact circle)."""
+        ...
     config: NavMeshQueryConfig
 
 class NavMesh:
@@ -211,6 +291,9 @@ class NavMesh:
         ...
     def free_map(self) -> None:
         """Release the currently loaded map, if any."""
+        ...
+    def get_loaded_tiles(self) -> list[TileInfo]:
+        """TileInfo for every currently loaded tile. Raises RuntimeError if no map is loaded."""
         ...
     def find_path(
         self,

@@ -402,3 +402,170 @@ def test_query_obtained_after_reload_still_works():
 
     result = nm.query.find_nearest_poly(START)
     assert result.found is True
+
+
+# --- World Navigation / NavMesh Introspection ---------------------------------------
+
+
+@requires_real_mmaps
+def test_get_poly_returns_structural_data():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    nearest = nm.query.find_nearest_poly(START)
+    assert nearest.found
+
+    poly = nm.query.get_poly(nearest.poly_ref)
+    assert poly is not None
+    assert poly.ref == nearest.poly_ref
+    assert poly.type == wn.PolyType.GROUND
+    assert len(poly.vertices) >= 3
+    assert isinstance(poly.area, int)
+    assert isinstance(poly.flags, int)
+    assert isinstance(poly.center, tuple) and len(poly.center) == 3
+
+
+@requires_real_mmaps
+def test_get_poly_individual_accessors_match_get_poly():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    nearest = nm.query.find_nearest_poly(START)
+    assert nearest.found
+    ref = nearest.poly_ref
+    q = nm.query
+
+    poly = q.get_poly(ref)
+    assert q.get_poly_type(ref) == poly.type
+    assert q.get_poly_area(ref) == poly.area
+    assert q.get_poly_flags(ref) == poly.flags
+    assert q.get_poly_center(ref) == poly.center
+    assert q.get_poly_vertices(ref) == poly.vertices
+    assert q.get_poly_neighbors(ref) == poly.neighbors
+
+
+@requires_real_mmaps
+def test_get_poly_invalid_ref_returns_none_not_raise():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    q = nm.query
+
+    assert q.get_poly(0) is None
+    assert q.get_poly(0xFFFFFFFFFFFFFFFF) is None
+    assert q.get_poly_type(0) is None
+    assert q.get_poly_area(0) is None
+    assert q.get_poly_flags(0) is None
+    assert q.get_poly_center(0) is None
+    assert q.get_poly_vertices(0) == []
+    assert q.get_poly_neighbors(0) == []
+    assert q.get_tile_info(0) is None
+
+
+@requires_real_mmaps
+def test_get_poly_neighbors_are_reciprocal():
+    # If B is a neighbor of A, A must be reachable from B too -- the corridor graph is
+    # symmetric for internal links.
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    nearest = nm.query.find_nearest_poly(START)
+    assert nearest.found
+
+    neighbors = nm.query.get_poly_neighbors(nearest.poly_ref)
+    assert len(neighbors) >= 1
+    back = nm.query.get_poly_neighbors(neighbors[0])
+    assert nearest.poly_ref in back
+
+
+@requires_real_mmaps
+def test_get_loaded_tiles_and_get_tile_info_agree():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+
+    tiles = nm.get_loaded_tiles()
+    assert len(tiles) >= 1
+    for tile in tiles:
+        assert tile.poly_count >= 0
+        assert isinstance(tile.uses_liquids, bool)
+
+    nearest = nm.query.find_nearest_poly(START)
+    assert nearest.found
+    tile_info = nm.query.get_tile_info(nearest.poly_ref)
+    assert tile_info is not None
+    match = next(t for t in tiles if (t.x, t.y, t.layer) == (tile_info.x, tile_info.y, tile_info.layer))
+    assert match.poly_count == tile_info.poly_count
+
+
+@requires_real_mmaps
+def test_get_loaded_tiles_without_map_raises():
+    nm = wn.NavMesh(MMAPS_PATH)
+    with pytest.raises(RuntimeError):
+        nm.get_loaded_tiles()
+
+
+@requires_real_mmaps
+def test_get_tile_polys_matches_tile_poly_count():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    tiles = nm.get_loaded_tiles()
+    assert tiles
+
+    tile = tiles[0]
+    polys = nm.query.get_tile_polys(tile.x, tile.y, tile.layer)
+    assert len(polys) == tile.poly_count
+    for poly in polys:
+        assert poly.tile_x == tile.x
+        assert poly.tile_y == tile.y
+
+
+@requires_real_mmaps
+def test_get_tile_polys_missing_tile_returns_empty():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    assert nm.query.get_tile_polys(-1, -1, 0) == []
+
+
+@requires_real_mmaps
+def test_get_offmesh_connections_all_and_per_tile_agree():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    all_connections = nm.query.get_offmesh_connections()
+
+    for tile in nm.get_loaded_tiles():
+        per_tile = nm.query.get_offmesh_connections(tile.x, tile.y, tile.layer)
+        for conn in per_tile:
+            assert conn in all_connections
+        for conn in per_tile:
+            assert isinstance(conn.bidirectional, bool)
+            assert conn.radius >= 0
+
+
+@requires_real_mmaps
+def test_sample_polys_finds_polys_near_start():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    nearest = nm.query.find_nearest_poly(START)
+    assert nearest.found
+
+    polys = nm.query.sample_polys(START, 30.0)
+    assert len(polys) >= 1
+    assert any(p.ref == nearest.poly_ref for p in polys)
+
+
+@requires_real_mmaps
+def test_sample_polys_rejects_non_positive_radius():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    with pytest.raises(ValueError):
+        nm.query.sample_polys(START, 0.0)
+
+
+@requires_real_mmaps
+def test_introspection_becomes_stale_after_reload():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    q = nm.query
+    nearest = q.find_nearest_poly(START)
+    assert nearest.found
+
+    nm.load_map(0)
+
+    with pytest.raises(RuntimeError):
+        q.get_poly(nearest.poly_ref)
