@@ -44,6 +44,12 @@ endif()
 option(WOW_NAVMESH_POLYREF64
   "Build against the DT_POLYREF64 tile layout used by TrinityCore/AzerothCore mmaps" ON)
 
+if(NOT DEFINED Python_ROOT_DIR)
+  execute_process(
+    COMMAND python -c "import sys; print(sys.base_prefix)"
+    OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE Python_ROOT_DIR)
+endif()
+
 find_package(Python 3.10
   REQUIRED COMPONENTS Interpreter Development.Module)
 

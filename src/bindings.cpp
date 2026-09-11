@@ -26,10 +26,15 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// TrinityCore/AzerothCore's mmap generator writes tile files with these magic/version
-// values, independent of the tile's dtPolyRef width.
+// TrinityCore/AzerothCore's mmap generator writes tile files with this magic value,
+// independent of the tile's dtPolyRef width. mmapVersion itself is bumped by both forks
+// whenever generator *behavior* changes (e.g. a pathing fix requiring regeneration) —
+// TrinityCore's 3.3.5 branch is at 15 and AzerothCore's master at 20 as of writing, while
+// MmapTileHeader's on-disk layout has stayed the same since at least version 4. So we
+// only reject versions old enough to predate that header shape, rather than pinning to
+// one exact number that the next upstream bump would immediately break again.
 constexpr unsigned int kMmapMagic = 0x4d4d4150;  // 'MMAP'
-constexpr unsigned int kMmapVersion = 5;
+constexpr unsigned int kMmapVersionMin = 4;
 
 // Header of each .mmap tile file produced by TrinityCore/AzerothCore's mmap generator.
 struct MmapTileHeader {
@@ -152,6 +157,73 @@ using DtBuffer = std::unique_ptr<unsigned char, DtAllocDeleter>;
 
 using Point3 = std::tuple<float, float, float>;
 
+// Mirrors MaNGOS PathFinder's PATHFIND_* distinction: whether the path actually reaches
+// the requested end, or only gets as close as the navmesh allows.
+enum class PathType {
+    NotFound = 0,  // no path at all (start/end off the mesh, or no route between them)
+    Normal = 1,    // path reaches the requested end point
+    Partial = 2,   // path only reaches as close to the end as the navmesh allows
+};
+
+struct PathResult {
+    std::vector<Point3> points;
+    PathType path_type;
+    Point3 actual_end;  // last point actually reached; differs from the requested end
+                         // when path_type is Partial or NotFound.
+};
+
+// Distance (world units) beyond which a nearest-poly match is considered "off the mesh"
+// rather than a walkable point close enough to start/end from. Matches MaNGOS PathFinder.
+constexpr float kFarFromPolyDistance = 7.0f;
+
+// Midpoint of the shared portal edge between two adjacent polygons in a path corridor,
+// mirroring dtNavMeshQuery::getEdgeMidPoint (private upstream, so reimplemented here).
+// Used by find_path's centered=true mode to route through polygon interiors instead of
+// the funnel algorithm's taut string-pull, which stays as close to a wall as the corridor
+// allows. Returns false (skip this waypoint) for off-mesh connections or on any lookup
+// failure -- the caller falls back to just not inserting a midpoint there.
+bool portalMidpoint(const dtNavMesh* nav, dtPolyRef from, dtPolyRef to, float* mid) {
+    const dtMeshTile* fromTile = nullptr;
+    const dtPoly* fromPoly = nullptr;
+    if (dtStatusFailed(nav->getTileAndPolyByRef(from, &fromTile, &fromPoly)))
+        return false;
+    const dtMeshTile* toTile = nullptr;
+    const dtPoly* toPoly = nullptr;
+    if (dtStatusFailed(nav->getTileAndPolyByRef(to, &toTile, &toPoly)))
+        return false;
+    if (fromPoly->getType() != DT_POLYTYPE_GROUND || toPoly->getType() != DT_POLYTYPE_GROUND)
+        return false;
+
+    const dtLink* link = nullptr;
+    for (unsigned int i = fromPoly->firstLink; i != DT_NULL_LINK; i = fromTile->links[i].next) {
+        if (fromTile->links[i].ref == to) {
+            link = &fromTile->links[i];
+            break;
+        }
+    }
+    if (!link)
+        return false;
+
+    const int v0 = fromPoly->verts[link->edge];
+    const int v1 = fromPoly->verts[(link->edge + 1) % static_cast<int>(fromPoly->vertCount)];
+    float left[3], right[3];
+    dtVcopy(left, &fromTile->verts[v0 * 3]);
+    dtVcopy(right, &fromTile->verts[v1 * 3]);
+
+    // Tile-boundary links are clamped to the overlapping width of the two tiles' edges;
+    // narrow that down the same way before averaging.
+    if (link->side != 0xff && (link->bmin != 0 || link->bmax != 255)) {
+        const float s = 1.0f / 255.0f;
+        dtVlerp(left, &fromTile->verts[v0 * 3], &fromTile->verts[v1 * 3], link->bmin * s);
+        dtVlerp(right, &fromTile->verts[v0 * 3], &fromTile->verts[v1 * 3], link->bmax * s);
+    }
+
+    mid[0] = (left[0] + right[0]) * 0.5f;
+    mid[1] = (left[1] + right[1]) * 0.5f;
+    mid[2] = (left[2] + right[2]) * 0.5f;
+    return true;
+}
+
 // Wraps a dtNavMesh/dtNavMeshQuery pair for one loaded map. mmap tile files store
 // coordinates as (y, z, x) instead of WoW's (x, y, z); the swap happens at the
 // find_path boundary so callers only ever see WoW-order coordinates.
@@ -209,11 +281,11 @@ public:
                 if (header.mmapMagic != kMmapMagic)
                     throw std::runtime_error("mmtile has wrong mmap magic (not a TrinityCore/"
                                               "AzerothCore mmap file?): " + tile_path_str);
-                if (header.mmapVersion != kMmapVersion)
+                if (header.mmapVersion < kMmapVersionMin)
                     throw std::runtime_error(
                         "mmtile has unsupported mmap format version " +
-                        std::to_string(header.mmapVersion) + " (expected " +
-                        std::to_string(kMmapVersion) + "): " + tile_path_str);
+                        std::to_string(header.mmapVersion) + " (expected >= " +
+                        std::to_string(kMmapVersionMin) + "): " + tile_path_str);
                 if (static_cast<int>(header.dtVersion) != DT_NAVMESH_VERSION)
                     throw std::runtime_error(
                         "mmtile wrapper header reports Detour version " +
@@ -278,9 +350,14 @@ public:
     // Returns the straight path between start and end as a list of (x, y, z) points
     // in WoW world coordinates. Returns an empty list if no path could be found.
     // waypoint_distance: if set, subdivides segments to maintain max distance between waypoints.
-    std::vector<Point3> find_path(Point3 start, Point3 end, int max_points = 256,
-                                   std::optional<float> waypoint_distance = std::nullopt,
-                                   float search_extent = 50.0f) {
+    // centered: route through polygon portal-edge midpoints instead of the funnel
+    // algorithm's taut string-pull. Trades a longer, less direct path for staying away
+    // from walls (the string-pull is the shortest path, so it hugs corners whenever the
+    // corridor allows it). max_points is ignored in this mode: the point count is fixed
+    // by the polygon corridor (one midpoint per portal crossed, plus start/end).
+    PathResult find_path(Point3 start, Point3 end, int max_points = 256,
+                          std::optional<float> waypoint_distance = std::nullopt,
+                          float search_extent = 50.0f, bool centered = false) {
         if (!nav_mesh_ || !nav_query_)
             throw std::runtime_error("no map loaded; call load_map() first");
         if (max_points <= 0)
@@ -300,11 +377,16 @@ public:
 
         dtStatus status = nav_query_->findNearestPoly(s, extents, &filter, &start_poly, start_pt);
         if (dtStatusFailed(status) || !start_poly)
-            return {};
+            return {{}, PathType::NotFound, start};
 
         status = nav_query_->findNearestPoly(e, extents, &filter, &end_poly, end_pt);
         if (dtStatusFailed(status) || !end_poly)
-            return {};
+            return {{}, PathType::NotFound, start};
+
+        // Farther than this from the nearest poly means the requested point is off the
+        // mesh entirely, so any path found only gets close rather than truly arriving.
+        const bool far_from_poly = dtVdist(s, start_pt) > kFarFromPolyDistance ||
+                                    dtVdist(e, end_pt) > kFarFromPolyDistance;
 
         std::vector<dtPolyRef> path_polys(512);
         int path_count = 0;
@@ -312,20 +394,37 @@ public:
                                        path_polys.data(), &path_count,
                                        static_cast<int>(path_polys.size()));
         if (dtStatusFailed(status) || path_count == 0)
-            return {};
+            return {{}, PathType::NotFound, start};
 
-        std::vector<float> points(static_cast<size_t>(max_points) * 3);
-        int point_count = 0;
-        status = nav_query_->findStraightPath(start_pt, end_pt, path_polys.data(), path_count,
-                                               points.data(), nullptr, nullptr, &point_count,
-                                               max_points);
-        if (dtStatusFailed(status) || point_count == 0)
-            return {};
+        const bool reaches_end = path_polys[path_count - 1] == end_poly;
+        const PathType path_type =
+            (reaches_end && !far_from_poly) ? PathType::Normal : PathType::Partial;
 
         std::vector<Point3> result;
-        result.reserve(static_cast<size_t>(point_count));
-        for (int i = 0; i < point_count; i++)
-            result.emplace_back(points[i * 3 + 2], points[i * 3], points[i * 3 + 1]);
+
+        if (centered) {
+            result.emplace_back(start_pt[2], start_pt[0], start_pt[1]);
+            for (int i = 1; i < path_count; i++) {
+                float mid[3];
+                if (portalMidpoint(nav_mesh_, path_polys[i - 1], path_polys[i], mid))
+                    result.emplace_back(mid[2], mid[0], mid[1]);
+            }
+            result.emplace_back(end_pt[2], end_pt[0], end_pt[1]);
+        } else {
+            std::vector<float> points(static_cast<size_t>(max_points) * 3);
+            int point_count = 0;
+            status = nav_query_->findStraightPath(start_pt, end_pt, path_polys.data(), path_count,
+                                                   points.data(), nullptr, nullptr, &point_count,
+                                                   max_points);
+            if (dtStatusFailed(status) || point_count == 0)
+                return {{}, PathType::NotFound, start};
+
+            result.reserve(static_cast<size_t>(point_count));
+            for (int i = 0; i < point_count; i++)
+                result.emplace_back(points[i * 3 + 2], points[i * 3], points[i * 3 + 1]);
+        }
+
+        const Point3 actual_end = result.back();
 
         if (waypoint_distance) {
             std::vector<Point3> subdivided;
@@ -350,10 +449,10 @@ public:
                 }
                 subdivided.push_back(curr);
             }
-            return subdivided;
+            return {std::move(subdivided), path_type, actual_end};
         }
 
-        return result;
+        return {std::move(result), path_type, actual_end};
     }
 
 private:
@@ -368,6 +467,25 @@ private:
 NB_MODULE(_wow_navmesh, m) {
     m.doc() = "Python bindings for Detour navmesh pathfinding over TrinityCore/AzerothCore mmaps";
 
+    nb::enum_<PathType>(m, "PathType")
+        .value("NOT_FOUND", PathType::NotFound, "No path at all between start and end.")
+        .value("NORMAL", PathType::Normal, "Path reaches the requested end point.")
+        .value("PARTIAL", PathType::Partial,
+               "Path only reaches as close to the end as the navmesh allows.");
+
+    nb::class_<PathResult>(m, "PathResult")
+        .def_ro("points", &PathResult::points)
+        .def_ro("path_type", &PathResult::path_type)
+        .def_ro("actual_end", &PathResult::actual_end)
+        .def("__repr__", [](const PathResult& self) {
+            return "PathResult(points=<" + std::to_string(self.points.size()) +
+                   " points>, path_type=" +
+                   (self.path_type == PathType::Normal   ? "NORMAL"
+                    : self.path_type == PathType::Partial ? "PARTIAL"
+                                                           : "NOT_FOUND") +
+                   ")";
+        });
+
     nb::class_<NavMesh>(m, "NavMesh")
         .def(nb::init<std::string>(), nb::arg("mmaps_path"),
              "Create a NavMesh bound to a directory of .mmap/.mmtile files.")
@@ -377,12 +495,15 @@ NB_MODULE(_wow_navmesh, m) {
         .def("free_map", &NavMesh::free_map, "Release the currently loaded map, if any.")
         .def("find_path", &NavMesh::find_path, nb::arg("start"), nb::arg("end"),
              nb::arg("max_points") = 256, nb::arg("waypoint_distance") = nb::none(),
-             nb::arg("search_extent") = 50.0f,
-             "Find a path between two (x, y, z) points in world coordinates. Returns a list "
-             "of (x, y, z) tuples describing the straight path, or an empty list if no path "
-             "was found. waypoint_distance subdivides segments for precise bot navigation. "
-             "search_extent controls polygon search radius (default 50). Raises RuntimeError "
-             "if no map is loaded.")
+             nb::arg("search_extent") = 50.0f, nb::arg("centered") = false,
+             "Find a path between two (x, y, z) points in world coordinates. Returns a "
+             "PathResult with the straight-path points, a path_type (NORMAL/PARTIAL/NOT_FOUND), "
+             "and actual_end (the point the path actually reaches). waypoint_distance "
+             "subdivides segments for precise bot navigation. search_extent controls polygon "
+             "search radius (default 50). centered=True routes through polygon portal "
+             "midpoints instead of the shortest-path funnel, trading a longer/less direct "
+             "path for staying away from walls (max_points is ignored in this mode). "
+             "Raises RuntimeError if no map is loaded.")
         .def_prop_ro("is_loaded", &NavMesh::is_loaded)
         .def_prop_ro("map_id", &NavMesh::map_id)
         .def_prop_ro("mmaps_path", &NavMesh::mmaps_path)

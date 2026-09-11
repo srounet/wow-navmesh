@@ -92,9 +92,26 @@ def test_find_path_returns_polyline_near_endpoints():
 
     start = (4900.0, -4200.0, -500.0)
     end = (5025.0, -3825.0, -500.0)
-    path = nm.find_path(start, end, max_points=64)
+    result = nm.find_path(start, end, max_points=64)
+    path = result.points
 
     assert len(path) >= 2
+    assert result.path_type in (wn.PathType.NORMAL, wn.PathType.PARTIAL)
+
+
+@requires_real_mmaps
+def test_find_path_centered_returns_polyline_near_endpoints():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+
+    start = (4900.0, -4200.0, -500.0)
+    end = (5025.0, -3825.0, -500.0)
+    result = nm.find_path(start, end, centered=True)
+    path = result.points
+
+    assert len(path) >= 2
+    assert result.path_type in (wn.PathType.NORMAL, wn.PathType.PARTIAL)
+    assert result.actual_end == path[-1]
     # The straight path may snap to the walkable surface, so allow the extents
     # (50 units) used internally for the nearest-poly search.
     assert abs(path[0][0] - start[0]) < 50
