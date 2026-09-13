@@ -30,15 +30,22 @@ namespace {
 
 // TrinityCore/AzerothCore's mmap generator writes tile files with this magic value,
 // independent of the tile's dtPolyRef width. mmapVersion itself is bumped by both forks
-// whenever generator *behavior* changes (e.g. a pathing fix requiring regeneration) —
-// TrinityCore's 3.3.5 branch is at 15 and AzerothCore's master at 20 as of writing, while
-// MmapTileHeader's on-disk layout has stayed the same since at least version 4. So we
-// only reject versions old enough to predate that header shape, rather than pinning to
-// one exact number that the next upstream bump would immediately break again.
+// whenever generator *behavior* changes (e.g. a pathing fix requiring regeneration) --
+// TrinityCore's 3.3.5 branch is at 15 and AzerothCore's master at 20 as of writing. So we
+// only reject versions old enough to predate the header prefix below, rather than pinning
+// to one exact number that the next upstream bump would immediately break again.
+//
+// The header has *grown* across versions: version 4 wrote a bare 20 bytes, while version
+// 20 appends the Recast build parameters the tile was generated with (36 more bytes). The
+// 20-byte prefix below is stable, and the Detour payload is always the trailing
+// header.size bytes -- so the payload offset is read off the file rather than assumed to
+// be sizeof(MmapTileHeader), which keeps a future header growth from silently shifting
+// every read.
 constexpr unsigned int kMmapMagic = 0x4d4d4150;  // 'MMAP'
 constexpr unsigned int kMmapVersionMin = 4;
 
 // Header of each .mmap tile file produced by TrinityCore/AzerothCore's mmap generator.
+// Only the stable 20-byte prefix; later versions append fields we don't need.
 struct MmapTileHeader {
     unsigned int mmapMagic;
     unsigned int dtVersion;
@@ -47,6 +54,7 @@ struct MmapTileHeader {
     bool usesLiquids;
     char padding[3];
 };
+static_assert(sizeof(MmapTileHeader) == 20, "mmtile header prefix must stay 20 bytes");
 
 // The on-disk size of dtLink for either dtPolyRef width. dtLink packs a dtPolyRef, a
 // uint32 "next" index, and four bytes of edge/side/bmin/bmax; the struct's natural
@@ -407,6 +415,8 @@ inline std::vector<Point3> polyVertices(const dtMeshTile* tile, const dtPoly* po
 
 // Walks only resolved links (the chain is terminated by DT_NULL_LINK), so unconnected
 // edges (neis[i] == 0, i.e. mesh border) never show up here -- no extra filtering needed.
+// One ref can appear more than once: a poly split across several edges of a tile border
+// gets one link per edge segment, all pointing at the same neighbour.
 inline std::vector<dtPolyRef> polyNeighbors(const dtMeshTile* tile, const dtPoly* poly) {
     std::vector<dtPolyRef> neighbors;
     for (unsigned int i = poly->firstLink; i != DT_NULL_LINK; i = tile->links[i].next)
@@ -745,9 +755,10 @@ public:
     }
 
     // World-navigation introspection: raw dtPoly/dtMeshTile/dtOffMeshConnection data for
-    // Python, without exposing Detour pointers. Never throws for an invalid/stale
-    // poly_ref -- returns None (or an empty list) instead, since callers are expected to
-    // probe refs of unknown/expired provenance (e.g. from a previous map generation).
+    // Python, without exposing Detour pointers. Never throws for an *invalid* poly_ref --
+    // returns None (or an empty list) instead, since callers are expected to probe refs of
+    // unknown provenance. Does throw (via ensureFresh()) if the query object itself is
+    // stale, i.e. the map was reloaded or freed out from under it.
     std::optional<PolyInfo> get_poly(dtPolyRef ref) const {
         ensureFresh();
         const dtMeshTile* tile = nullptr;
@@ -833,6 +844,8 @@ public:
                                                              std::optional<int> tile_y,
                                                              int tile_layer) const {
         ensureFresh();
+        if (tile_x.has_value() != tile_y.has_value())
+            throw std::invalid_argument("tile_x and tile_y must both be given, or both omitted");
         std::vector<OffMeshConnection> result;
         auto collect = [&](const dtMeshTile* tile) {
             if (!tile || !tile->header)
@@ -857,7 +870,7 @@ public:
         ensureFresh();
         if (radius <= 0)
             throw std::invalid_argument("radius must be positive");
-        const int maxPolys = max_polys.value_or(128);
+        const int maxPolys = max_polys.value_or(config_.max_path_polys);
         if (maxPolys <= 0)
             throw std::invalid_argument("max_polys must be positive");
         const dtQueryFilter defaultFilter;
@@ -871,6 +884,11 @@ public:
         std::vector<PolyInfo> result;
         if (dtStatusFailed(st))
             return result;
+        // queryPolygons reports overflow as a detail flag on a *success* status; without
+        // this the caller would silently get an arbitrary maxPolys-sized subset.
+        if (dtStatusDetail(st, DT_BUFFER_TOO_SMALL))
+            throw std::runtime_error("sample_polys: more than " + std::to_string(maxPolys) +
+                                      " polygons in range; raise max_polys or shrink radius");
         result.reserve(static_cast<std::size_t>(count));
         for (int i = 0; i < count; i++) {
             const dtMeshTile* tile = nullptr;
@@ -1152,10 +1170,21 @@ public:
                         std::to_string(header.dtVersion) + " (expected " +
                         std::to_string(DT_NAVMESH_VERSION) + "): " + tile_path_str);
 
+                // The Detour payload is the trailing header.size bytes, so whatever sits
+                // between our 20-byte prefix and it is header fields a newer generator
+                // added. Deriving the offset this way reads those versions correctly
+                // instead of starting the payload short by exactly that many bytes.
+                const std::uintmax_t file_size = fs::file_size(tile_path);
+                if (file_size < header.size + sizeof(MmapTileHeader))
+                    throw std::runtime_error("mmtile is smaller than its own declared payload "
+                                              "size: " + tile_path_str);
+                const std::uintmax_t payload_offset = file_size - header.size;
+
                 DtBuffer data(static_cast<unsigned char*>(dtAlloc(header.size, DT_ALLOC_PERM)));
                 if (!data)
                     throw std::bad_alloc();
 
+                tf.seekg(static_cast<std::streamoff>(payload_offset), std::ios::beg);
                 tf.read(reinterpret_cast<char*>(data.get()), header.size);
                 if (!tf)
                     throw std::runtime_error("mmtile data is truncated: " + tile_path_str);
@@ -1163,7 +1192,11 @@ public:
 
                 checkTileLayout(tile_path_str, data.get(), header.size);
 
-                tile_uses_liquids_[tileKey(static_cast<int>(x), static_cast<int>(y))] =
+                // Key off the tile's own dtMeshHeader, not the file name indices: the
+                // generator derives dtMeshHeader::x/y from the Detour-axis tile origin,
+                // which is transposed relative to the WoW grid indices in the name.
+                const dtMeshHeader* meshHeader = reinterpret_cast<const dtMeshHeader*>(data.get());
+                tile_uses_liquids_[tileKey(meshHeader->x, meshHeader->y, meshHeader->layer)] =
                     header.usesLiquids;
 
                 dtStatus status =
@@ -1214,8 +1247,8 @@ public:
 
     // uses_liquids is TrinityCore/AzerothCore's own per-tile MmapTileHeader flag, not
     // part of Detour's dtMeshHeader -- tracked separately here, keyed by tile grid coords.
-    bool tileUsesLiquids(int x, int y) const {
-        const auto it = tile_uses_liquids_.find(tileKey(x, y));
+    bool tileUsesLiquids(int x, int y, int layer) const {
+        const auto it = tile_uses_liquids_.find(tileKey(x, y, layer));
         return it != tile_uses_liquids_.end() && it->second;
     }
 
@@ -1228,7 +1261,8 @@ public:
             const dtMeshTile* tile = mesh->getTile(i);
             if (!tile || !tile->header)
                 continue;
-            result.push_back(buildTileInfo(tile, tileUsesLiquids(tile->header->x, tile->header->y)));
+            result.push_back(buildTileInfo(tile, tileUsesLiquids(tile->header->x, tile->header->y,
+                                                       tile->header->layer)));
         }
         return result;
     }
@@ -1363,9 +1397,10 @@ public:
     }
 
 private:
-    static std::uint64_t tileKey(int x, int y) {
-        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
-               static_cast<std::uint32_t>(y);
+    static std::uint64_t tileKey(int x, int y, int layer) {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x) & 0xFFFFFFu) << 40) |
+               (static_cast<std::uint64_t>(static_cast<std::uint32_t>(y) & 0xFFFFFFu) << 16) |
+               (static_cast<std::uint32_t>(layer) & 0xFFFFu);
     }
 
     std::string mmaps_path_;
@@ -1400,7 +1435,8 @@ inline std::optional<TileInfo> NavigationQuery::get_tile_info(dtPolyRef ref) con
     const dtPoly* poly = nullptr;
     if (!ref || dtStatusFailed(mesh_->getTileAndPolyByRef(ref, &tile, &poly)))
         return std::nullopt;
-    return buildTileInfo(tile, owner_->tileUsesLiquids(tile->header->x, tile->header->y));
+    return buildTileInfo(tile, owner_->tileUsesLiquids(tile->header->x, tile->header->y,
+                                                    tile->header->layer));
 }
 
 }  // namespace
@@ -1619,7 +1655,8 @@ NB_MODULE(_wow_navmesh, m) {
         .def("sample_polys", &NavigationQuery::sample_polys, nb::arg("center"), nb::arg("radius"),
              nb::arg("filter") = nb::none(), nb::arg("max_polys") = nb::none(),
              "PolyInfo for every polygon within radius of center (an axis-aligned box "
-             "query, not an exact circle).")
+             "query, not an exact circle). Raises RuntimeError if more than max_polys "
+             "polygons are in range.")
         .def_prop_rw("config", &NavigationQuery::config, &NavigationQuery::set_config);
 
     nb::class_<NavMesh>(m, "NavMesh")
