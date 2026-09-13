@@ -30,15 +30,22 @@ namespace {
 
 // TrinityCore/AzerothCore's mmap generator writes tile files with this magic value,
 // independent of the tile's dtPolyRef width. mmapVersion itself is bumped by both forks
-// whenever generator *behavior* changes (e.g. a pathing fix requiring regeneration) —
-// TrinityCore's 3.3.5 branch is at 15 and AzerothCore's master at 20 as of writing, while
-// MmapTileHeader's on-disk layout has stayed the same since at least version 4. So we
-// only reject versions old enough to predate that header shape, rather than pinning to
-// one exact number that the next upstream bump would immediately break again.
+// whenever generator *behavior* changes (e.g. a pathing fix requiring regeneration) --
+// TrinityCore's 3.3.5 branch is at 15 and AzerothCore's master at 20 as of writing. So we
+// only reject versions old enough to predate the header prefix below, rather than pinning
+// to one exact number that the next upstream bump would immediately break again.
+//
+// The header has *grown* across versions: version 4 wrote a bare 20 bytes, while version
+// 20 appends the Recast build parameters the tile was generated with (36 more bytes). The
+// 20-byte prefix below is stable, and the Detour payload is always the trailing
+// header.size bytes -- so the payload offset is read off the file rather than assumed to
+// be sizeof(MmapTileHeader), which keeps a future header growth from silently shifting
+// every read.
 constexpr unsigned int kMmapMagic = 0x4d4d4150;  // 'MMAP'
 constexpr unsigned int kMmapVersionMin = 4;
 
 // Header of each .mmap tile file produced by TrinityCore/AzerothCore's mmap generator.
+// Only the stable 20-byte prefix; later versions append fields we don't need.
 struct MmapTileHeader {
     unsigned int mmapMagic;
     unsigned int dtVersion;
@@ -47,6 +54,7 @@ struct MmapTileHeader {
     bool usesLiquids;
     char padding[3];
 };
+static_assert(sizeof(MmapTileHeader) == 20, "mmtile header prefix must stay 20 bytes");
 
 // The on-disk size of dtLink for either dtPolyRef width. dtLink packs a dtPolyRef, a
 // uint32 "next" index, and four bytes of edge/side/bmin/bmax; the struct's natural
@@ -1162,10 +1170,21 @@ public:
                         std::to_string(header.dtVersion) + " (expected " +
                         std::to_string(DT_NAVMESH_VERSION) + "): " + tile_path_str);
 
+                // The Detour payload is the trailing header.size bytes, so whatever sits
+                // between our 20-byte prefix and it is header fields a newer generator
+                // added. Deriving the offset this way reads those versions correctly
+                // instead of starting the payload short by exactly that many bytes.
+                const std::uintmax_t file_size = fs::file_size(tile_path);
+                if (file_size < header.size + sizeof(MmapTileHeader))
+                    throw std::runtime_error("mmtile is smaller than its own declared payload "
+                                              "size: " + tile_path_str);
+                const std::uintmax_t payload_offset = file_size - header.size;
+
                 DtBuffer data(static_cast<unsigned char*>(dtAlloc(header.size, DT_ALLOC_PERM)));
                 if (!data)
                     throw std::bad_alloc();
 
+                tf.seekg(static_cast<std::streamoff>(payload_offset), std::ios::beg);
                 tf.read(reinterpret_cast<char*>(data.get()), header.size);
                 if (!tf)
                     throw std::runtime_error("mmtile data is truncated: " + tile_path_str);

@@ -585,3 +585,39 @@ def test_introspection_becomes_stale_after_reload():
 
     with pytest.raises(RuntimeError):
         q.get_poly(nearest.poly_ref)
+
+
+def _write_fake_mmaps(dir_path, header_extra_bytes):
+    """A 000.mmap plus one 0000000.mmtile whose MmapTileHeader has header_extra_bytes of
+    trailing fields (0 = the original version-4 shape, 36 = AzerothCore's version 20).
+
+    The Detour payload is deliberately just a dtMeshHeader magic/version stub: enough to
+    prove load_map() found the payload at the right offset, not enough to be a real tile.
+    """
+    import struct
+
+    # dtNavMeshParams: float orig[3], tileWidth, tileHeight, int maxTiles, maxPolys.
+    (dir_path / "000.mmap").write_bytes(
+        struct.pack("<5f2i", 0.0, 0.0, 0.0, 533.33333, 533.33333, 4096, 1 << 14)
+    )
+
+    payload = struct.pack("<II", 0x444E4156, 7) + b"\0" * 92  # 'DNAV', DT_NAVMESH_VERSION
+    header = struct.pack("<4IB3x", 0x4D4D4150, 7, 20, len(payload), 1)
+    (dir_path / "0000000.mmtile").write_bytes(header + b"\0" * header_extra_bytes + payload)
+
+
+@pytest.mark.parametrize("header_extra_bytes", [0, 36])
+def test_mmtile_payload_offset_is_derived_from_file_size(tmp_path, header_extra_bytes):
+    # The mmap generator has grown MmapTileHeader across versions (20 bytes at version 4,
+    # 56 at version 20). Both must locate the Detour payload -- reading it at a hardcoded
+    # sizeof(MmapTileHeader) starts 36 bytes early on the newer shape and reports the
+    # resulting garbage as a bad navmesh magic.
+    _write_fake_mmaps(tmp_path, header_extra_bytes)
+    nm = wn.NavMesh(str(tmp_path))
+    nm.load_map(0)
+
+    tiles = nm.get_loaded_tiles()
+    assert len(tiles) == 1
+    assert (tiles[0].x, tiles[0].y, tiles[0].layer) == (0, 0, 0)
+    # Also pins the uses_liquids lookup to the tile's own dtMeshHeader coords.
+    assert tiles[0].uses_liquids is True
