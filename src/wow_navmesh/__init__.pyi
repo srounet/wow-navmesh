@@ -127,7 +127,8 @@ class PolyInfo:
     vertices: list[Point3]
     neighbors: list[PolyRef]
     """PolyRefs of polygons reachable across this polygon's edges (unconnected/border
-    edges are never included)."""
+    edges are never included). A ref can repeat: a neighbour touching several edge
+    segments of a tile border has one link per segment."""
     tile_x: int
     tile_y: int
     tile_layer: int
@@ -260,7 +261,9 @@ class NavigationQuery:
         tile_layer: int = 0,
     ) -> list[OffMeshConnection]:
         """All off-mesh connections in the given tile, or across every loaded tile if
-        tile_x/tile_y are omitted."""
+        tile_x/tile_y are both omitted.
+
+        Raises ValueError if only one of tile_x/tile_y is given."""
         ...
     def sample_polys(
         self,
@@ -270,7 +273,10 @@ class NavigationQuery:
         max_polys: int | None = None,
     ) -> list[PolyInfo]:
         """PolyInfo for every polygon within radius of center (an axis-aligned box query,
-        not an exact circle)."""
+        not an exact circle).
+
+        Raises RuntimeError if more than max_polys polygons are in range (defaults to
+        config.max_path_polys) rather than returning an arbitrary subset."""
         ...
     config: NavMeshQueryConfig
 

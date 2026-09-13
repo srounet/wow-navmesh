@@ -191,8 +191,9 @@ if poly:
     print(poly.neighbors)  # list[PolyRef] reachable across this poly's edges
 ```
 
-`get_poly()` returns `None` — never raises — for `0`, a garbage `dtPolyRef`, or a ref
-from a map generation that's since been reloaded/freed (see
+`get_poly()` returns `None` — never raises — for `0` or a garbage `dtPolyRef`. A ref from
+a map generation that's since been reloaded or freed is different: the query object itself
+is stale, so any call on it raises `RuntimeError` (see
 [Map lifecycle](#map-lifecycle)). Lean single-field wrappers avoid building the whole
 `PolyInfo` when only one value is needed:
 
@@ -203,6 +204,7 @@ kind = nm.query.get_poly_type(poly_ref)        # PolyType | None
 center = nm.query.get_poly_center(poly_ref)    # (x, y, z) | None
 verts = nm.query.get_poly_vertices(poly_ref)   # list[(x, y, z)], [] if invalid
 neighbors = nm.query.get_poly_neighbors(poly_ref)  # list[PolyRef], [] if invalid
+# (a ref can repeat — a neighbour across several segments of a tile border has one link each)
 ```
 
 ### Inspecting tiles
@@ -238,6 +240,9 @@ for conn in nm.query.get_offmesh_connections():
 connections = nm.query.get_offmesh_connections(tile.x, tile.y, tile.layer)
 ```
 
+Pass both `tile_x` and `tile_y` or neither — passing only one raises `ValueError` rather
+than quietly falling back to every tile.
+
 See [Limitations](#limitations) — TrinityCore/AzerothCore's mmap generator doesn't
 currently emit any, so this is untested against real data.
 
@@ -254,6 +259,10 @@ for poly in nearby:
 
 The `radius` bounds an axis-aligned box, not an exact circle — polygons slightly beyond
 `radius` at the corners of that box can be included.
+
+If more than `max_polys` polygons fall in range (default: `config.max_path_polys`),
+`sample_polys()` raises `RuntimeError` instead of returning an arbitrary subset — raise
+`max_polys` or shrink `radius`.
 
 ### `PolyRef`
 

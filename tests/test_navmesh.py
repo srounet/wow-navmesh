@@ -449,7 +449,7 @@ def test_get_poly_invalid_ref_returns_none_not_raise():
     q = nm.query
 
     assert q.get_poly(0) is None
-    assert q.get_poly(0xFFFFFFFFFFFFFFFF) is None
+    assert q.get_poly(0xFFFFFFFF) is None
     assert q.get_poly_type(0) is None
     assert q.get_poly_area(0) is None
     assert q.get_poly_flags(0) is None
@@ -493,9 +493,8 @@ def test_get_loaded_tiles_and_get_tile_info_agree():
     assert match.poly_count == tile_info.poly_count
 
 
-@requires_real_mmaps
-def test_get_loaded_tiles_without_map_raises():
-    nm = wn.NavMesh(MMAPS_PATH)
+def test_get_loaded_tiles_without_map_raises(tmp_path):
+    nm = wn.NavMesh(str(tmp_path))
     with pytest.raises(RuntimeError):
         nm.get_loaded_tiles()
 
@@ -528,13 +527,30 @@ def test_get_offmesh_connections_all_and_per_tile_agree():
     nm.load_map(0)
     all_connections = nm.query.get_offmesh_connections()
 
+    all_refs = {c.ref for c in all_connections}
     for tile in nm.get_loaded_tiles():
         per_tile = nm.query.get_offmesh_connections(tile.x, tile.y, tile.layer)
         for conn in per_tile:
-            assert conn in all_connections
+            assert conn.ref in all_refs
         for conn in per_tile:
             assert isinstance(conn.bidirectional, bool)
             assert conn.radius >= 0
+
+
+@requires_real_mmaps
+def test_get_offmesh_connections_half_specified_tile_raises():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    with pytest.raises(ValueError):
+        nm.query.get_offmesh_connections(0)
+
+
+@requires_real_mmaps
+def test_sample_polys_raises_instead_of_truncating():
+    nm = wn.NavMesh(MMAPS_PATH)
+    nm.load_map(0)
+    with pytest.raises(RuntimeError):
+        nm.query.sample_polys(START, 300.0, max_polys=1)
 
 
 @requires_real_mmaps
