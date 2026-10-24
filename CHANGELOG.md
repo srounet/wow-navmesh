@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.0.1] - 2026-10-24
+
+Published to PyPI as `wow-navmesh` 1.0.1. No functional changes from 1.0.0.
+
 ## [1.0.0] - 2026-10-24
 
 First public release of wow-navmesh: Python bindings for Detour, the navmesh query
